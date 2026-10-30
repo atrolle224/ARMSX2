@@ -45,6 +45,9 @@ jobs:
   # ---- PC arm64 Qt GUI (mac / linux) -------------------------------------
   pc-macos-arm64:
     name: PC · macOS arm64 (Qt)
+    # Off in this fork: only the Android APK is needed, and GitHub's macOS arm64 runners are often
+    # too busy to pick the job up, which marked whole runs as failed. Delete this line to re-enable.
+    if: false
     uses: ./.github/workflows/macos_build.yml
     with:
       jobName: "macOS arm64"
@@ -161,6 +164,8 @@ jobs:
   # ---- iOS .app ----------------------------------------------------------
   ios:
     name: iOS (arm64, unsigned device IPA)
+    # Off in this fork (see pc-macos-arm64). Delete this line to re-enable.
+    if: false
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
