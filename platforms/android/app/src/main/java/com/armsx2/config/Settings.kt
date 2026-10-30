@@ -30,8 +30,10 @@ import org.json.JSONObject
  *   4. Surface a widget in the appropriate Settings tab.
  */
 /** One DEV9 internal-DNS host override: [url] resolves to [ip] when DNS mode = Internal.
- *  Used for private/fan servers (e.g. obsrv for RE Outbreak) that redirect specific hostnames. */
+ *  Used for private/fan servers (e.g. obsrv for RE Outbreak) that redirect specific hostnames.
+ *  [name] is only a label for the user (PCSX2's "Desc" key) and has no effect on resolution. */
 data class Dev9HostMapping(
+    val name: String = "",
     val url: String = "",
     val ip: String = "0.0.0.0",
     val enabled: Boolean = true,
@@ -1100,7 +1102,7 @@ data class Settings(
         put("DEV9/Eth/Hosts", "Count", "int", network.dev9EthHosts.size.toString())
         network.dev9EthHosts.forEachIndexed { i, h ->
             put("DEV9/Eth/Hosts/Host$i", "Url", "string", h.url)
-            put("DEV9/Eth/Hosts/Host$i", "Desc", "string", "ARMSX2")
+            put("DEV9/Eth/Hosts/Host$i", "Desc", "string", h.name.ifBlank { "ARMSX2" })
             put("DEV9/Eth/Hosts/Host$i", "Address", "string", h.ip.ifEmpty { "0.0.0.0" })
             put("DEV9/Eth/Hosts/Host$i", "Enabled", "bool", h.enabled.toString())
         }
@@ -1485,12 +1487,13 @@ data class Settings(
                 dev9AutoGateway = boolAt("DEV9/Eth/AutoGateway") ?: this.network.dev9AutoGateway,
                 dev9ModeDns1 = strAt("DEV9/Eth/ModeDNS1") ?: this.network.dev9ModeDns1,
                 dev9ModeDns2 = strAt("DEV9/Eth/ModeDNS2") ?: this.network.dev9ModeDns2,
-                // Internal-DNS host overrides — Count gates Host{i} sections (Desc is ignored).
+                // Internal-DNS host overrides — Count gates Host{i} sections. Desc is the user's label.
                 dev9EthHosts = run {
                 val count = intAt("DEV9/Eth/Hosts/Count") ?: return@run this.network.dev9EthHosts
                 (0 until count).mapNotNull { idx ->
                     val url = ini["DEV9/Eth/Hosts/Host$idx/Url"] ?: return@mapNotNull null
                     Dev9HostMapping(
+                        name = ini["DEV9/Eth/Hosts/Host$idx/Desc"].orEmpty(),
                         url = url,
                         ip = (ini["DEV9/Eth/Hosts/Host$idx/Address"] ?: "0.0.0.0").ifEmpty { "0.0.0.0" },
                         enabled = boolAt("DEV9/Eth/Hosts/Host$idx/Enabled") ?: true,
@@ -2116,6 +2119,7 @@ data class Settings(
         put("dev9EthHosts", JSONArray().apply {
             network.dev9EthHosts.forEach { h ->
                 put(JSONObject().apply {
+                    put("name", h.name)
                     put("url", h.url)
                     put("ip", h.ip)
                     put("enabled", h.enabled)
@@ -2517,6 +2521,7 @@ data class Settings(
                     (0 until arr.length()).mapNotNull { idx ->
                         arr.optJSONObject(idx)?.let { o ->
                             Dev9HostMapping(
+                                name = o.optString("name", ""),
                                 url = o.optString("url", ""),
                                 ip = o.optString("ip", "0.0.0.0").ifEmpty { "0.0.0.0" },
                                 enabled = o.optBoolean("enabled", true),
@@ -2755,6 +2760,7 @@ data class Settings(
                 j.put("dev9EthHosts", JSONArray().apply {
                     current.network.dev9EthHosts.forEach { host ->
                         put(JSONObject().apply {
+                            put("name", host.name)
                             put("url", host.url)
                             put("ip", host.ip)
                             put("enabled", host.enabled)
@@ -3093,6 +3099,7 @@ data class Settings(
                             array.optJSONObject(index)?.let { host ->
                                 add(
                                     Dev9HostMapping(
+                                        name = host.optString("name"),
                                         url = host.optString("url"),
                                         ip = host.optString("ip", "0.0.0.0"),
                                         enabled = host.optBoolean("enabled", true),
