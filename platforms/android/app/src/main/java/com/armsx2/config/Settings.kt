@@ -39,6 +39,15 @@ data class Dev9HostMapping(
     val enabled: Boolean = true,
 )
 
+/** EQOAEmu patch server (https://eqoaemu.com/connection-guide). The default Internal DNS entry in
+ *  this build: hostname and IP must match the guide exactly. */
+val EQOA_EMU_HOST = Dev9HostMapping(
+    name = "EQOAEmu",
+    url = "patch.everquestonlineadventures.com",
+    ip = "54.189.250.11",
+    enabled = true,
+)
+
 /** RetroAchievements' options, the [Achievements] section the RetroAchievements screen and the
  *  in-game menu's 🏆 tab edit. Standard settings, so what is chosen for a game applies to that
  *  game and outranks the global value; they used to be written straight into the global native
@@ -632,8 +641,8 @@ data class OutputSettings(
 data class NetworkSettings(
 
     // ---- DEV9 — PS2 HDD / Ethernet ----
-    /** DEV9/Eth/EthEnable — PS2 network adapter. */
-    val dev9EthEnable: Boolean = false,
+    /** DEV9/Eth/EthEnable — PS2 network adapter. On by default in this EQOAEmu build. */
+    val dev9EthEnable: Boolean = true,
     /** DEV9/Eth/EthApi — "Sockets" for internet play, "Local Link" for device-to-device LAN. */
     val dev9EthApi: String = "Sockets",
     // ---- Local Link (EthApi = "Local Link") -------------------------------------------------
@@ -667,11 +676,12 @@ data class NetworkSettings(
     val dev9Dns2: String = "0.0.0.0",
     val dev9AutoMask: Boolean = true,
     val dev9AutoGateway: Boolean = true,
-    val dev9ModeDns1: String = "Auto",
-    val dev9ModeDns2: String = "Auto",
+    // Internal by default in this EQOAEmu build, so the host entry below is used out of the box.
+    val dev9ModeDns1: String = "Internal",
+    val dev9ModeDns2: String = "Internal",
     /** DEV9/Eth/Hosts — hostname->IP overrides consulted by the INTERNAL DNS server
      *  (DNS mode = Internal). For private/fan servers that redirect specific hostnames. */
-    val dev9EthHosts: List<Dev9HostMapping> = emptyList(),
+    val dev9EthHosts: List<Dev9HostMapping> = listOf(EQOA_EMU_HOST),
     /** DEV9/Hdd/HddEnable — virtual PS2 HDD. */
     val dev9HddEnable: Boolean = false,
     /** DEV9/Hdd/HddFile — path/name of the virtual HDD image. */

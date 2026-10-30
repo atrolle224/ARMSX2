@@ -82,6 +82,69 @@ class MemoryCardViewModel(application: Application) : AndroidViewModel(applicati
         refresh()
     }
 
+    /**
+     * "Choose card file" for [slot]: use a .ps2 card from anywhere on the device.
+     *
+     * With full storage access (granted in setup) the card is used IN PLACE: the slot stores the
+     * file's full path, the core opens it directly (Pcsx2Config::FullpathToMcd), and saves go into
+     * that file. Without it (or for a provider with no real path, such as a cloud drive) Android
+     * only hands us a stream, so the card is copied into the cards folder and that copy assigned.
+     * [serial] non-null = set it for that game only, like the per-card slot buttons.
+     */
+    fun chooseCardFile(slot: Int, uri: Uri, serial: String?) {
+        val context = getApplication<Application>()
+        val displayName = DocumentFile.fromSingleUri(context, uri)?.name?.ifBlank { null } ?: "card.ps2"
+        val inPlace = devicePathFor(uri)?.takeIf { looksLikeFileCard(it) }
+        if (inPlace != null) {
+            if (serial != null) assignNameToGame(serial, slot, inPlace.absolutePath, displayName)
+            else assignName(slot, inPlace.absolutePath, displayName)
+            return
+        }
+        // Fallback: copy in, then assign the copy. Reuses import() so .zip folder cards work too.
+        val before = cardDirectory().listFiles().orEmpty().map { it.name }.toSet()
+        import(uri)
+        val added = cardDirectory().listFiles().orEmpty().firstOrNull { it.name !in before } ?: return
+        val note = " (copied into the app's cards folder: allow full storage access to use cards in place)"
+        if (serial != null) assignNameToGame(serial, slot, added.name, added.name + note)
+        else assignName(slot, added.name, added.name + note)
+    }
+
+    /** The slot's card when it is used in place (a full path), else null. */
+    fun externalCard(slot: Int, serial: String?): String? {
+        val name = if (serial != null) perGameCard(serial, slot) else {
+            val sys = ConfigStore.loadGlobal().system
+            if (slot == 1) sys.memoryCardSlot1Filename.takeIf { sys.memoryCardSlot1Enabled }
+            else sys.memoryCardSlot2Filename.takeIf { sys.memoryCardSlot2Enabled }
+        }
+        return name?.takeIf { it.startsWith("/") }
+    }
+
+    /** Stop using an in-place card: slot goes back to the app's default card for that slot. */
+    fun clearExternalCard(slot: Int, serial: String?) {
+        if (serial != null) clearGameCard(serial, slot)
+        else assignName(slot, if (slot == 1) "mcd001.ps2" else "mcd002.ps2", if (slot == 1) "mcd001.ps2" else "mcd002.ps2")
+    }
+
+    /** A real, readable and writable file path for a document picked from on-device storage, or
+     *  null. Only the system storage provider maps to paths ("primary:Download/x.ps2" or
+     *  "1234-ABCD:EQOA/x.ps2" for an SD card); cloud and app providers do not. */
+    private fun devicePathFor(uri: Uri): File? = runCatching {
+        if (android.os.Build.VERSION.SDK_INT >= 30 && !android.os.Environment.isExternalStorageManager()) return null
+        if (uri.authority != "com.android.externalstorage.documents") return null
+        val docId = android.provider.DocumentsContract.getDocumentId(uri)
+        val volume = docId.substringBefore(':', "")
+        val relative = docId.substringAfter(':', "")
+        if (volume.isEmpty() || relative.isEmpty()) return null
+        val root = if (volume.equals("primary", true)) android.os.Environment.getExternalStorageDirectory() else File("/storage/$volume")
+        File(root, relative).takeIf { it.isFile && it.canRead() && it.canWrite() }
+    }.getOrNull()
+
+    /** File cards are whole pages: 512-byte pages, or 528 with ECC (an 8 MB card is 8,650,752). */
+    private fun looksLikeFileCard(file: File): Boolean {
+        val n = file.length()
+        return n >= 512L * 1024L && (n % 528L == 0L || n % 512L == 0L)
+    }
+
     fun import(uri: Uri) {
         val context = getApplication<Application>()
         val name = DocumentFile.fromSingleUri(context, uri)?.name?.ifBlank { null } ?: "Imported.ps2"
@@ -227,24 +290,28 @@ class MemoryCardViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    fun assign(slot: Int, item: MemoryCardItem) {
+    fun assign(slot: Int, item: MemoryCardItem) = assignName(slot, item.file.name, item.file.name)
+
+    /** Point [slot] at [name]: a card in the cards folder (bare file name) or, for a card used in
+     *  place elsewhere on the device, its full path. [label] is what the message calls it. */
+    private fun assignName(slot: Int, name: String, label: String) {
         if (!MainActivityRuntime.nativeReady.value) {
             state.value = state.value.copy(error = "The emulator core is still starting.")
             return
         }
         val success = runCatching {
             NativeApp.setSetting("MemoryCards", "Slot${slot}_Enable", "bool", "false")
-            NativeApp.setSetting("MemoryCards", "Slot${slot}_Filename", "string", item.file.name)
+            NativeApp.setSetting("MemoryCards", "Slot${slot}_Filename", "string", name)
             NativeApp.setSetting("MemoryCards", "Slot${slot}_Enable", "bool", "true")
             NativeApp.commitSettings()
             val current = ConfigStore.loadGlobal()
             ConfigStore.saveGlobal(
-                if (slot == 1) current.copy(system = current.system.copy(memoryCardSlot1Enabled = true, memoryCardSlot1Filename = item.file.name))
-                else current.copy(system = current.system.copy(memoryCardSlot2Enabled = true, memoryCardSlot2Filename = item.file.name)),
+                if (slot == 1) current.copy(system = current.system.copy(memoryCardSlot1Enabled = true, memoryCardSlot1Filename = name))
+                else current.copy(system = current.system.copy(memoryCardSlot2Enabled = true, memoryCardSlot2Filename = name)),
             )
             true
         }.getOrDefault(false)
-        state.value = if (success) state.value.copy(message = "${item.file.name} assigned to slot $slot.") else state.value.copy(error = "Unable to change slot $slot.")
+        state.value = if (success) state.value.copy(message = "$label assigned to slot $slot.") else state.value.copy(error = "Unable to change slot $slot.")
         refresh()
     }
 
@@ -254,16 +321,19 @@ class MemoryCardViewModel(application: Application) : AndroidViewModel(applicati
      * already resolves and applies this at every boot, so no native call is needed —
      * it takes effect the next time the game starts.
      */
-    fun assignToGame(serial: String, slot: Int, item: MemoryCardItem) {
+    fun assignToGame(serial: String, slot: Int, item: MemoryCardItem) =
+        assignNameToGame(serial, slot, item.file.name, item.file.name)
+
+    private fun assignNameToGame(serial: String, slot: Int, name: String, label: String) {
         val resolved = ConfigStore.resolveForGame(serial)
         val updated = if (slot == 1) {
-            resolved.copy(system = resolved.system.copy(memoryCardSlot1Enabled = true, memoryCardSlot1Filename = item.file.name))
+            resolved.copy(system = resolved.system.copy(memoryCardSlot1Enabled = true, memoryCardSlot1Filename = name))
         } else {
-            resolved.copy(system = resolved.system.copy(memoryCardSlot2Enabled = true, memoryCardSlot2Filename = item.file.name))
+            resolved.copy(system = resolved.system.copy(memoryCardSlot2Enabled = true, memoryCardSlot2Filename = name))
         }
         val ok = runCatching { ConfigStore.save(SettingsScope.Game, serial, updated) }.isSuccess
         state.value = if (ok) {
-            state.value.copy(message = "${item.file.name} set for this game (slot $slot). Restart the game to apply.")
+            state.value.copy(message = "$label set for this game (slot $slot). Restart the game to apply.")
         } else {
             state.value.copy(error = "Unable to set a per-game card.")
         }

@@ -77,6 +77,16 @@ fun MemoryCardScreen(onBack: () -> Unit, game: GameInfo? = null, viewModel: Memo
         val src = exportPending; exportPending = null
         if (uri != null && src != null) viewModel.export(src.file, uri)
     }
+    // "Choose card file": which slot the picker is for, then the picker itself.
+    var choosingSlot by remember { mutableIntStateOf(1) }
+    val cardPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) viewModel.chooseCardFile(choosingSlot, uri, serial)
+    }
+    val pickCard: (Int) -> Unit = { slot -> choosingSlot = slot; cardPicker.launch(arrayOf("application/octet-stream", "*/*")) }
+    // Re-read whenever the screen state changes: every assign/clear ends in refresh(), which
+    // publishes a new state, so these follow each change.
+    val externalSlot1 = remember(state, serial) { viewModel.externalCard(1, serial) }
+    val externalSlot2 = remember(state, serial) { viewModel.externalCard(2, serial) }
     LaunchedEffect(Unit) { viewModel.refresh() }
 
     ArmsBackdrop {
@@ -96,6 +106,14 @@ fun MemoryCardScreen(onBack: () -> Unit, game: GameInfo? = null, viewModel: Memo
                         RoundAction("↻", str("games.card.refresh"), viewModel::refresh)
                     },
                     horizontalPadding = 0.dp,
+                )
+            }
+            item {
+                ExternalCardPanel(
+                    slot1 = externalSlot1,
+                    slot2 = externalSlot2,
+                    onChoose = pickCard,
+                    onClear = { slot -> viewModel.clearExternalCard(slot, serial) },
                 )
             }
             if (state.cards.isEmpty()) {
@@ -272,6 +290,55 @@ fun MemoryCardScreen(onBack: () -> Unit, game: GameInfo? = null, viewModel: Memo
             onDismiss = viewModel::dismissMessage,
             idPrefix = "memcard.message",
         )
+    }
+}
+
+/**
+ * "Card from another location": pick a .ps2 file anywhere on the device for Slot 1 or 2. With full
+ * storage access it is used where it is (saves go into that file); otherwise it is copied in. Shows
+ * the in-place card each slot is using, with a way back to the app's own card.
+ */
+@Composable
+private fun ExternalCardPanel(
+    slot1: String?,
+    slot2: String?,
+    onChoose: (Int) -> Unit,
+    onClear: (Int) -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(str("memcard.external.title"), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+            Text(str("memcard.external.help"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            listOf(1 to slot1, 2 to slot2).forEach { (slot, path) ->
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.weight(1f)) {
+                        Text(str(if (slot == 1) "memcard.slot1" else "memcard.slot2"), fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                        Text(
+                            path ?: str("memcard.external.none"),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (path != null) Success else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (path != null) {
+                        TextButton(
+                            onClick = { onClear(slot) },
+                            modifier = Modifier.controllerFocusable("memcard.external.$slot.clear", onConfirm = { onClear(slot) }),
+                        ) { Text(str("memcard.external.stop")) }
+                    }
+                    OutlinedButton(
+                        onClick = { onChoose(slot) },
+                        modifier = Modifier.controllerFocusable("memcard.external.$slot.choose", onConfirm = { onChoose(slot) }),
+                    ) { Text(str("memcard.external.choose")) }
+                }
+            }
+        }
     }
 }
 

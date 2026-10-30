@@ -2367,6 +2367,10 @@ std::string Pcsx2Config::FullpathToBios() const
 
 std::string Pcsx2Config::FullpathToMcd(uint slot) const
 {
+	// A full path means "use this card where it is" (Android: a card picked from anywhere on the
+	// device). A bare name stays relative to the memory cards folder, as before.
+	if (Path::IsAbsolute(Mcd[slot].Filename))
+		return Mcd[slot].Filename;
 	return Path::Combine(EmuFolders::MemoryCards, Mcd[slot].Filename);
 }
 
