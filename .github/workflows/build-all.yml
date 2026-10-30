@@ -308,3 +308,33 @@ jobs:
             --arg desc "Commit \`${{ github.sha }}\` by ${{ github.actor }} failed a required build." \
             '{username:"ARMSX2 CI", embeds:[{title:"❌ master build broke", url:$url, color:15158332, description:$desc}]}' \
           | curl -fsSL -H 'Content-Type: application/json' -d @- "$HOOK"
+
+  # Fork-only housekeeping: once this run has produced the Android APK, delete this branch's older
+  # runs of this workflow (their pages, logs and downloads), keeping only the newest build. Skipped
+  # in the official ARMSX2 repo, and skipped if this run produced no APK, so a broken build never
+  # removes the last working one.
+  cleanup-old-runs:
+    name: Delete older builds
+    needs: android
+    if: ${{ always() && github.repository_owner != 'ARMSX2' && needs.android.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      THIS_RUN: ${{ github.run_id }}
+    steps:
+      - name: Delete older runs on this branch
+        run: |
+          if ! gh api "repos/$REPO/actions/runs/$THIS_RUN/artifacts" --jq '.artifacts[].name' | grep -qx 'armsx2-android-arm64'; then
+            echo "This run has no Android APK; keeping older builds."
+            exit 0
+          fi
+          gh api --paginate "repos/$REPO/actions/workflows/build-all.yml/runs?branch=$BRANCH&status=completed&per_page=100" \
+            --jq ".workflow_runs[] | select(.id != $THIS_RUN) | .id" |
+          while read -r id; do
+            echo "Deleting run $id"
+            gh api -X DELETE "repos/$REPO/actions/runs/$id" || echo "Could not delete run $id"
+          done
