@@ -1012,7 +1012,7 @@ private val BASE_EN: Map<String, String> = mapOf(
     "network.dnsMode.manual.desc" to "Use the DNS server address you enter below.",
     "network.dnsMode.auto.desc" to "Use this device's DNS servers. On Android this can leave the PS2 with no DNS at all; if a game cannot connect, use Internal or Manual.",
     "network.dnsMode.internal.desc" to "Use the emulator's resolver ({ip}): hostnames in the Internal DNS list go to their set IP, everything else resolves normally.",
-    "network.ipHint" to "IPv4 address, e.g. 54.189.250.11",
+    "network.ipHint" to "IPv4 address, e.g. 192.168.1.10",
     "network.internalDns.header" to "Internal DNS",
     "network.internalDns.help" to "Send a hostname to an IP of your choice, for example a fan-run revival server. The hostname and IP must match the server's guide exactly; the name is only a label. Used when Primary or Secondary DNS is set to Internal.",
     "network.internalDns.inactiveWarning" to "These entries are not in use: neither DNS slot is set to Internal.",

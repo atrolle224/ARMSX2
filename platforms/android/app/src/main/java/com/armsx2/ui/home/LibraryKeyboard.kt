@@ -30,6 +30,8 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -103,10 +105,32 @@ object LibraryKeyboard {
         return useSystemIme.value
     }
 
-    fun open(initial: String, onChange: (String) -> Unit, placeholder: String = "Search games…") {
+    /** Per-open overrides for a settings field (see [open]). Reset on every open. */
+    private val forceSystemIme = mutableStateOf(false)
+    private val fieldMode = mutableStateOf(false)
+    private val keyboardType = mutableStateOf(KeyboardType.Text)
+
+    /**
+     * [systemIme] true = use Android's keyboard for this open even when the "Use system keyboard"
+     * preference is off. Settings fields pass it for a TOUCH tap, so a phone user typing an address
+     * gets the keyboard they expect, while a gamepad confirm still gets the D-pad key grid.
+     * [type] picks the IME layout; a non-null type also marks this as a settings field, which turns
+     * off auto-capitalisation and autocorrect (a capitalised hostname silently never matches) and
+     * shows Done instead of Search.
+     */
+    fun open(
+        initial: String,
+        onChange: (String) -> Unit,
+        placeholder: String = "Search games…",
+        systemIme: Boolean = false,
+        type: KeyboardType? = null,
+    ) {
         text.value = initial
         this.onChange = onChange
         this.placeholder.value = placeholder
+        forceSystemIme.value = systemIme
+        fieldMode.value = type != null
+        keyboardType.value = type ?: KeyboardType.Text
         // Re-read on every open so the preference needs no wiring into app startup, and so a
         // change made in Settings takes effect the next time the keyboard is summoned.
         refreshUseSystemIme()
@@ -188,7 +212,7 @@ object LibraryKeyboard {
                 Modifier.padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                if (useSystemIme.value) {
+                if (useSystemIme.value || forceSystemIme.value) {
                     SystemImeField()
                     return@Column
                 }
@@ -247,8 +271,20 @@ object LibraryKeyboard {
             },
             placeholder = { Text(placeholder.value) },
             singleLine = true,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-            keyboardActions = KeyboardActions(onSearch = { ime?.hide(); close() }),
+            keyboardOptions = if (fieldMode.value) {
+                KeyboardOptions(
+                    capitalization = KeyboardCapitalization.None,
+                    autoCorrectEnabled = false,
+                    keyboardType = keyboardType.value,
+                    imeAction = ImeAction.Done,
+                )
+            } else {
+                KeyboardOptions(imeAction = ImeAction.Search)
+            },
+            keyboardActions = KeyboardActions(
+                onSearch = { ime?.hide(); close() },
+                onDone = { ime?.hide(); close() },
+            ),
             modifier = Modifier.fillMaxWidth().focusRequester(focus),
         )
         // Summon the IME with the field, and make sure it goes away with the overlay — otherwise a

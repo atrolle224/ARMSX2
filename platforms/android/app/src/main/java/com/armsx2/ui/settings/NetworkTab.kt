@@ -459,7 +459,8 @@ private fun InternalDnsSection(s: Settings, save: (Settings) -> Unit) {
     // on load). Name defaults to a label like PCSX2's "New Host" and the IP is set on the card.
     val hostPrompt = str("network.internalDns.hostname.hint")
     val newName = str("network.internalDns.defaultName")
-    val add = {
+    // A tap opens Android's keyboard; a gamepad confirm opens the D-pad key grid.
+    val addWith = { system: Boolean ->
         com.armsx2.ui.home.LibraryKeyboard.open(
             "",
             { typed ->
@@ -469,6 +470,8 @@ private fun InternalDnsSection(s: Settings, save: (Settings) -> Unit) {
                 save(s.copy(network = net.copy(dev9EthHosts = list)))
             },
             hostPrompt,
+            systemIme = system,
+            type = androidx.compose.ui.text.input.KeyboardType.Uri,
         )
     }
     TapRow(
@@ -476,7 +479,8 @@ private fun InternalDnsSection(s: Settings, save: (Settings) -> Unit) {
         label = "+ " + str("network.internalDns.add"),
         description = str("network.internalDns.add.desc"),
         accent = true,
-        onTap = add,
+        onTap = { addWith(true) },
+        onPadConfirm = { addWith(false) },
     )
 }
 
@@ -512,6 +516,7 @@ private fun HostEntryCard(
             value = entry.name,
             emptyText = str("network.localLink.notSet"),
             fieldLabel = str("network.internalDns.name"),
+            keyboardType = androidx.compose.ui.text.input.KeyboardType.Text,
         ) { onUpdate(entry.copy(name = it.trim())) }
         TextFieldRow(
             controllerId = "$id.url",
@@ -620,15 +625,19 @@ private fun TextFieldRow(
     emptyText: String,
     fieldLabel: String,
     description: String? = null,
+    keyboardType: androidx.compose.ui.text.input.KeyboardType = androidx.compose.ui.text.input.KeyboardType.Uri,
     onChange: (String) -> Unit,
 ) {
-    val edit = { com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel) }
+    // Touch opens Android's own keyboard; a gamepad confirm opens the D-pad key grid, since the
+    // system keyboard cannot be driven with a controller.
+    val tap = { com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, systemIme = true, type = keyboardType) }
+    val padEdit = { com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, type = keyboardType) }
     Column(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
-            .clickable(onClick = edit)
-            .controllerFocusable(controllerId, onConfirm = edit)
+            .clickable(onClick = tap)
+            .controllerFocusable(controllerId, onConfirm = padEdit)
             .padding(horizontal = 6.dp, vertical = 10.dp),
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -657,6 +666,8 @@ private fun TapRow(
     description: String?,
     accent: Boolean = false,
     danger: Boolean = false,
+    /** Gamepad confirm, when it should differ from a tap (e.g. key grid vs system keyboard). */
+    onPadConfirm: (() -> Unit)? = null,
     onTap: () -> Unit,
 ) {
     Column(
@@ -665,7 +676,7 @@ private fun TapRow(
             .clip(RoundedCornerShape(16.dp))
             .background(rowAura())
             .clickable(onClick = onTap)
-            .controllerFocusable(controllerId, onConfirm = onTap)
+            .controllerFocusable(controllerId, onConfirm = onPadConfirm ?: onTap)
             .padding(horizontal = 6.dp, vertical = 12.dp),
     ) {
         Text(
@@ -840,14 +851,17 @@ private fun LocalLinkRow(
     // no way to type or dismiss. LibraryKeyboard is D-pad navigable by design, and it also honours
     // the "Use system keyboard" preference for touch users.
     val edit = {
-        com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel)
+        com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, type = androidx.compose.ui.text.input.KeyboardType.Uri)
+    }
+    val tap = {
+        com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, systemIme = true, type = androidx.compose.ui.text.input.KeyboardType.Uri)
     }
     Column(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(rowAura())
-            .clickable(onClick = edit)
+            .clickable(onClick = tap)
             .controllerFocusable(
                 controllerId,
                 onConfirm = edit,
@@ -934,14 +948,17 @@ private fun HddFileRow(fileName: String, onChange: (String) -> Unit, onReset: ()
     // how every other row in this app uses left/right on the focused control.
     val fieldLabel = str("network.hddImage.fieldLabel")
     val edit = {
-        com.armsx2.ui.home.LibraryKeyboard.open(fileName, { onChange(it.trim()) }, fieldLabel)
+        com.armsx2.ui.home.LibraryKeyboard.open(fileName, { onChange(it.trim()) }, fieldLabel, type = androidx.compose.ui.text.input.KeyboardType.Uri)
+    }
+    val tap = {
+        com.armsx2.ui.home.LibraryKeyboard.open(fileName, { onChange(it.trim()) }, fieldLabel, systemIme = true, type = androidx.compose.ui.text.input.KeyboardType.Uri)
     }
     Box(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(rowAura())
-            .clickable(onClick = edit)
+            .clickable(onClick = tap)
             .controllerFocusable("network.hddImage", onConfirm = edit, onLeft = onReset)
             .padding(horizontal = 6.dp, vertical = 4.dp),
         contentAlignment = Alignment.CenterStart,
