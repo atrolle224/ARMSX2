@@ -149,7 +149,7 @@ jobs:
         run: rustup target add aarch64-linux-android
 
       - name: Build release APK
-        run: ./gradlew :app:assembleRelease --stacktrace
+        run: ./gradlew :app:assembleRelease --stacktrace -Parmsx2.applicationId=com.armsx2.dnsmod "-Parmsx2.appLabel=ARMSX2 DNS"
 
       - name: Upload APK
         uses: actions/upload-artifact@v7
