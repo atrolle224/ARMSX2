@@ -78,7 +78,7 @@ object PadRouter {
      * For one person on a handheld that gets docked: its own controls and a Bluetooth pad both
      * drive player 1. Saved pins apply again once this is off.
      */
-    @Volatile var allToPlayer1 = false
+    @Volatile var allToPlayer1 = true
         private set
     private const val KEY_ALL_P1 = "pad_router_all_p1"
 
@@ -93,8 +93,10 @@ object PadRouter {
         pinned.clear()
         rumbleModes.clear()
         allToPlayer1 = runCatching {
-            com.armsx2.runtime.MainActivityRuntime.prefs.getBoolean(KEY_ALL_P1, false)
-        }.getOrDefault(false)
+            // This build: on unless switched off, so a handheld's own controls and a connected
+            // Bluetooth pad both drive player 1 with nothing to set up.
+            com.armsx2.runtime.MainActivityRuntime.prefs.getBoolean(KEY_ALL_P1, true)
+        }.getOrDefault(true)
         runCatching {
             val raw = com.armsx2.runtime.MainActivityRuntime.prefs.getString(KEY_PINNED, null)
             if (raw != null) {
