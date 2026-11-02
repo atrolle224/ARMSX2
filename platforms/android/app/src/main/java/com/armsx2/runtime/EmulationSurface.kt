@@ -146,6 +146,13 @@ class EmulationSurface(context: Context) :
      * to its ~60 Hz mode instead of introducing 3:2 cadence.
      */
     fun applyFrameRatePreference() {
+        // A fixed rate chosen in the App settings (this build: 90 Hz by default) wins over the
+        // Low Latency choice below.
+        val fixedHz = com.armsx2.config.DisplayRefreshPreference.hz()
+        if (fixedHz > 0 && gameActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && holder.surface.isValid) {
+            applyFixedRefreshRate(fixedHz.toFloat())
+            return
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
             !gameActive ||
             !holder.surface.isValid ||
@@ -182,6 +189,30 @@ class EmulationSurface(context: Context) :
         }
     }
 
+    /** The screen mode of this resolution nearest [hz]: asked of the window (the mode itself) and
+     *  of the surface (its frame rate, changed even when the switch isn't seamless). */
+    private fun applyFixedRefreshRate(hz: Float) {
+        val display = currentDisplay() ?: return
+        val mode = display.supportedModes
+            .filter {
+                it.physicalWidth == display.mode.physicalWidth &&
+                    it.physicalHeight == display.mode.physicalHeight
+            }
+            .minByOrNull { abs(it.refreshRate - hz) } ?: return
+        val rate = mode.refreshRate
+        if (abs(rate - lastRequestedFrameRate) < RATE_EPSILON) return
+        runCatching {
+            hostWindow()?.let { w -> w.attributes = w.attributes.apply { preferredDisplayModeId = mode.modeId } }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                holder.surface.setFrameRate(rate, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT, Surface.CHANGE_FRAME_RATE_ALWAYS)
+            } else {
+                @Suppress("DEPRECATION")
+                holder.surface.setFrameRate(rate, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+            }
+            lastRequestedFrameRate = rate
+        }
+    }
+
     private fun clearFrameRatePreference() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
             !holder.surface.isValid ||
@@ -197,6 +228,11 @@ class EmulationSurface(context: Context) :
             } else {
                 @Suppress("DEPRECATION")
                 holder.surface.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+            }
+        }
+        runCatching {
+            hostWindow()?.let { w ->
+                if (w.attributes.preferredDisplayModeId != 0) w.attributes = w.attributes.apply { preferredDisplayModeId = 0 }
             }
         }
         lastRequestedFrameRate = Float.NaN

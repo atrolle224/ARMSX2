@@ -966,6 +966,20 @@ fun AppTab() {
             }
         }
 
+        // The screen's refresh rate while a game runs (this build: 90 Hz unless changed).
+        var refreshHz by remember { mutableStateOf(com.armsx2.config.DisplayRefreshPreference.hz()) }
+        val refreshOptions = com.armsx2.config.DisplayRefreshPreference.OPTIONS
+        SegmentedRow(
+            label = str("app.refreshRate"),
+            options = refreshOptions.map { if (it == 0) str("app.refreshRate.auto") else "$it Hz" },
+            selectedIndex = refreshOptions.indexOf(refreshHz).coerceAtLeast(0),
+            description = str("app.refreshRate.desc"),
+            onChange = {
+                refreshHz = refreshOptions[it]
+                com.armsx2.config.DisplayRefreshPreference.set(refreshOptions[it])
+            },
+        )
+
         SegmentedRow(
             label = str("app.toolbarPosition"),
             options = listOf(str("app.toolbarPosition.top"), str("app.toolbarPosition.bottom")),
