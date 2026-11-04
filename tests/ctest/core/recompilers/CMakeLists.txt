@@ -25,6 +25,9 @@ add_pcsx2_test(recompiler_tests
 	iop_shift_tests.cpp
 	iop_muldiv_tests.cpp
 	iop_loadstore_tests.cpp
+	iop_load_fastpath_tests.cpp
+	iop_cycle_accounting_tests.cpp
+	iop_frame_tests.cpp
 	iop_jump_tests.cpp
 	iop_branch_tests.cpp
 	iop_cop0_tests.cpp
@@ -39,6 +42,12 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_alu_tests.cpp
 	ee_rec_alu64_tests.cpp
 	ee_rec_fuzz_tests.cpp
+	ee_rec_const_flush_tests.cpp
+	ee_rec_mult_const_operand_tests.cpp
+	ee_rec_div_const_pow2_tests.cpp
+	ee_rec_div_const_divisor_tests.cpp
+	ee_rec_shift_pair_tests.cpp
+	ee_rec_madd_tests.cpp
 	ee_rec_alu_imm_tests.cpp
 	ee_rec_branch_tests.cpp
 	ee_rec_loop_residency_tests.cpp
@@ -73,6 +82,7 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_pinned_gpr_tests.cpp
 	ee_rec_syscall_seam_tests.cpp
 	ee_rec_event_stub_tests.cpp
+	ee_rec_fast_forward_mark_tests.cpp
 	ee_rec_regalloc_coupling_tests.cpp
 	ee_rec_muldiv_tests.cpp
 	ee_rec_multiblock_tests.cpp
