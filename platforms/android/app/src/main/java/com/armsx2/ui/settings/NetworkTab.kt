@@ -470,7 +470,7 @@ private fun InternalDnsSection(s: Settings, save: (Settings) -> Unit) {
                 save(s.copy(network = net.copy(dev9EthHosts = list)))
             },
             hostPrompt,
-            systemIme = system,
+            systemKeyboard = system,
             type = androidx.compose.ui.text.input.KeyboardType.Uri,
         )
     }
@@ -630,7 +630,7 @@ private fun TextFieldRow(
 ) {
     // Touch opens Android's own keyboard; a gamepad confirm opens the D-pad key grid, since the
     // system keyboard cannot be driven with a controller.
-    val tap = { com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, systemIme = true, type = keyboardType) }
+    val tap = { com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, systemKeyboard = true, type = keyboardType) }
     val padEdit = { com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, type = keyboardType) }
     Column(
         Modifier
@@ -854,7 +854,7 @@ private fun LocalLinkRow(
         com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, type = androidx.compose.ui.text.input.KeyboardType.Uri)
     }
     val tap = {
-        com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, systemIme = true, type = androidx.compose.ui.text.input.KeyboardType.Uri)
+        com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel, systemKeyboard = true, type = androidx.compose.ui.text.input.KeyboardType.Uri)
     }
     Column(
         Modifier
@@ -951,7 +951,7 @@ private fun HddFileRow(fileName: String, onChange: (String) -> Unit, onReset: ()
         com.armsx2.ui.home.LibraryKeyboard.open(fileName, { onChange(it.trim()) }, fieldLabel, type = androidx.compose.ui.text.input.KeyboardType.Uri)
     }
     val tap = {
-        com.armsx2.ui.home.LibraryKeyboard.open(fileName, { onChange(it.trim()) }, fieldLabel, systemIme = true, type = androidx.compose.ui.text.input.KeyboardType.Uri)
+        com.armsx2.ui.home.LibraryKeyboard.open(fileName, { onChange(it.trim()) }, fieldLabel, systemKeyboard = true, type = androidx.compose.ui.text.input.KeyboardType.Uri)
     }
     Box(
         Modifier

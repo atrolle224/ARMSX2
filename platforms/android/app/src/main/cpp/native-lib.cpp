@@ -12,6 +12,8 @@
 #include "pcsx2/GS.h"
 #include "pcsx2/Counters.h"
 #include "pcsx2/Elfheader.h" // ElfObject, for the boot-ELF disc pairing
+#include "pcsx2/IopThread/IopThreadMode.h"
+#include "pcsx2/IopThread/IopThreadVm.h"
 #include "pcsx2/IopThread/OwnerAsserts.h"
 #include "pcsx2/VMManager.h"
 #include "pcsx2/AutoTune/AutoTuneApplier.h" // per-game auto-tune record: read, reset, write back
@@ -33,7 +35,9 @@
 #include "GS/Renderers/Common/GSDevice.h" // GSDevice::SetShaderChainParams (shader chain params)
 #include "GS/Renderers/Vulkan/VKShaderCache.h"
 #include "GS/Renderers/Vulkan/GSLsfg.h" // LSFG availability query (JNI)
+#include "GS/DriverReport/GSDriverReport.h" // standalone driver report (problem report)
 #include "GS/DriverReport/GSDriverReportActive.h" // which Vulkan driver is open (malisx2 notice)
+#include "GS/DriverReport/GSDriverReportJson.h" // JsonWriter, for the status getters below
 #include "GS/DriverReport/GSDriverReportClassify.h" // IsMaliSX2Pack (malisx2 notice)
 #include "GSDumpReplayer.h"
 #include "ImGui/ImGuiManager.h"
@@ -46,6 +50,7 @@
 #include "Input/InputManager.h"
 #include "USB/USB.h"
 #include "USB/deviceproxy.h"
+#include "USB/usb-mic/audiodev-oboe.h" // Android microphone capture (Audio settings, Microphone)
 #include "DEV9/ACJV.h"
 #include "DEV9/ACSRAM.h"
 #include "common/ARCADE.h"
@@ -70,6 +75,7 @@
 #include "libchdr/chd.h"
 #include <zlib.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 #include "common/HostSys.h"
@@ -258,6 +264,116 @@ Java_kr_co_iefriends_pcsx2_NativeApp_saveScreenshot(JNIEnv* env, jclass, jstring
     }
     // Callable from the input path (UI thread) as well as a hotkey, so marshal like captureGsDump.
     Host::RunOnGSThread([target = std::move(target)]() { GSQueueSnapshot(target, 0); });
+}
+
+// A GS dump whose output location the caller chooses, for the problem report. captureGsDump above
+// lets the core name the file, so nobody but the core knows where the zip will be; here the caller
+// passes the base name, and the finished bundle is GSDumpBundle::ZipPath(base) = "<base>.gs.zip".
+// The zip appears whole or not at all once the dump closes, so Kotlin polls for it. Same shape as
+// PINE's QueueGSDump, for the same reason: the request has to be handed to the GS thread from the
+// CPU thread (the MTGS ring is single-producer), and the answer is only "was it accepted", since
+// GSQueueSnapshot refuses when a snapshot is already pending.
+//
+// Needs a running VM that draws frames: the dump is opened at the next present, so a game that
+// stays paused never produces it. The caller resumes the game and waits.
+//
+// Blocks until the GS thread has taken the request, so not from the UI thread.
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_captureGsDumpTo(JNIEnv* env, jclass, jstring basePath, jint frames) {
+    if (!VMManager::HasValidVM())
+        return JNI_FALSE;
+
+    std::string base = GetJavaString(env, basePath);
+    // QueueSnapshot takes the base name from a path ending in .png and silently falls back to an
+    // auto-named file in snaps/ for anything else, so drop whatever suffix the caller spelled out
+    // and add .png ourselves.
+    for (const std::string_view suffix : {".gs.zip", ".gs.zst", ".gs.xz", ".gs", ".png"}) {
+        if (StringUtil::EndsWithNoCase(base, suffix)) {
+            base.erase(base.size() - suffix.size());
+            break;
+        }
+    }
+    if (base.empty())
+        return JNI_FALSE;
+
+    const u32 n = (frames > 0) ? static_cast<u32>(frames) : 1u;
+    bool queued = false;
+    Host::RunOnCPUThread([&]() {
+        // Checked again here: the VM can shut down between the check above and this task running,
+        // and a shut-down VM has no GS thread to hand the request to.
+        if (!VMManager::HasValidVM() || !MTGS::IsOpen())
+            return;
+        MTGS::RunOnGSThread([&]() {
+            // A second request while one records would take a screenshot and write no dump, and
+            // the caller would then wait for a zip that never appears.
+            if (GSIsDumpRecording())
+                return;
+            queued = GSQueueSnapshot(base + ".png", n);
+        });
+        MTGS::WaitGS(false);
+    }, /*block=*/true);
+
+    Console.WriteLn("@@ANDROID_GSDUMP_TO@@ queued=%d frames=%u", queued ? 1 : 0, n);
+    return queued ? JNI_TRUE : JNI_FALSE;
+}
+
+// Where the dump requested with captureGsDumpTo has got to: {phase, vsyncsToOpen, vsyncsToRecorded}.
+// Phase is GSDumpPhase: 0 idle, 1 queued, 2 recording, 3 packing, 4 done. "Packing" is the moment
+// every frame is in the dump, before the screenshot is written and the zip built, which takes
+// seconds on a handheld; the problem report pauses the game on it instead of on the finished zip.
+// Reads atomics only, so it is cheap, callable from any thread, and works with no game running
+// (idle, or whatever the last request left).
+extern "C"
+JNIEXPORT jlongArray JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getGsDumpStatus(JNIEnv* env, jclass) {
+    const GSDumpStatus status = GSGetDumpStatus();
+    const jlong values[3] = {
+        static_cast<jlong>(status.phase),
+        static_cast<jlong>(status.vsyncs_to_open),
+        static_cast<jlong>(status.vsyncs_to_recorded),
+    };
+    jlongArray out = env->NewLongArray(3);
+    if (out != nullptr)
+        env->SetLongArrayRegion(out, 0, 3, values);
+    return out;
+}
+
+// The GS driver report on its own, for a problem report made with no GS dump to take it from.
+// Works with no game running: the device, driver pack and kernel sections need none, and the
+// renderer sections are left empty (their steps say why).
+//
+// Only the device and renderer sections read GS-thread state, so only they run there (briefly);
+// the file-system and kernel checks, which can take seconds on a cold cache, run on this thread.
+// The report used to be built entirely on the GS thread and could stall emulation for as long.
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_writeSystemReport(JNIEnv* env, jclass, jstring jsonPath) {
+    const std::string path = GetJavaString(env, jsonPath);
+    if (path.empty())
+        return JNI_FALSE;
+
+    const auto run_on_gs_thread = [](const std::function<void()>& work) {
+        if (!MTGS::IsOpen())
+        {
+            work();
+            return;
+        }
+        Host::RunOnCPUThread([&]() {
+            // Checked on the CPU thread, which is also the one that shuts the VM down, so the answer
+            // holds for the rest of this task.
+            if (VMManager::HasValidVM() && MTGS::IsOpen())
+            {
+                MTGS::RunOnGSThread(work);
+                MTGS::WaitGS(false);
+            }
+            else
+            {
+                work();
+            }
+        }, /*block=*/true);
+    };
+    return GSDriverReport::WriteStandaloneReport(path, run_on_gs_thread) ? JNI_TRUE : JNI_FALSE;
 }
 
 // ADPF (PerformanceHintManager): hint the OS scheduler to raise the EE/GS/MTVU threads' CPU
@@ -1017,6 +1133,65 @@ extern "C"
 JNIEXPORT jfloat JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_getAverageFrameTime(JNIEnv*, jclass) {
     return VMManager::HasValidVM() ? static_cast<jfloat>(PerformanceMetrics::GetAverageFrameTime()) : 0.0f;
+}
+
+// Which Vulkan driver the last LoadVulkanLibrary was asked for and what it got, as JSON. A custom
+// driver that fails to open falls back to the system loader without any other sign, so the problem
+// report records `opened` next to `requested`. Readable with no game running.
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getCustomDriverStatus(JNIEnv *env, jclass) {
+    const Vulkan::CustomDriverStatus status = Vulkan::GetCustomDriverStatus();
+    GSDriverReport::JsonWriter w;
+    w.BeginObject();
+    w.KeyBool("requested", status.requested);
+    w.KeyBool("opened", status.opened);
+    w.KeyBool("required", status.required);
+    w.KeyString("dir", status.dir);
+    w.KeyString("name", status.name);
+    w.KeyString("redirect_dir", status.redirect_dir);
+    w.KeyString("hook_lib_dir", status.hook_lib_dir);
+    w.KeyString("failure", status.failure);
+    w.EndObject();
+    return env->NewStringUTF(w.TakeString().c_str());
+}
+
+// The performance numbers the in-game stats overlay shows, as JSON, for a "running slow" report.
+// `valid` is false with no VM, and every number is then 0. Threads or timers a device lacks
+// (no GS back thread, no IOP thread, no GPU timestamps) are null rather than a misleading 0.
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getPerfSnapshot(JNIEnv *env, jclass) {
+    const bool valid = VMManager::HasValidVM();
+    GSDriverReport::JsonWriter w;
+    w.BeginObject();
+    w.KeyBool("valid", valid);
+    if (valid) {
+        w.KeyDouble("fps", PerformanceMetrics::GetFPS());
+        w.KeyDouble("vps", PerformanceMetrics::GetInternalFPS());
+        w.KeyDouble("nominal_fps", VMManager::GetFrameRate());
+        w.KeyDouble("speed_percent", PerformanceMetrics::GetSpeed());
+        w.KeyDouble("ee_percent", PerformanceMetrics::GetCPUThreadUsage());
+        w.KeyDouble("gs_percent", PerformanceMetrics::GetGSThreadUsage());
+        if (PerformanceMetrics::HasGSBackThread())
+            w.KeyDouble("gs_back_percent", PerformanceMetrics::GetGSBackThreadUsage());
+        else
+            w.KeyNull("gs_back_percent");
+        w.KeyDouble("vu_percent", PerformanceMetrics::GetVUThreadUsage());
+        if (PerformanceMetrics::HasIOPThread())
+            w.KeyDouble("iop_percent", PerformanceMetrics::GetIOPThreadUsage());
+        else
+            w.KeyNull("iop_percent");
+        if (PerformanceMetrics::HasGPUTimer())
+            w.KeyDouble("gpu_percent", PerformanceMetrics::GetGPUUsage());
+        else
+            w.KeyNull("gpu_percent");
+        w.KeyDouble("frame_ms_avg", PerformanceMetrics::GetAverageFrameTime());
+        w.KeyDouble("frame_ms_min", PerformanceMetrics::GetMinimumFrameTime());
+        w.KeyDouble("frame_ms_max", PerformanceMetrics::GetMaximumFrameTime());
+    }
+    w.EndObject();
+    return env->NewStringUTF(w.TakeString().c_str());
 }
 
 extern "C"
@@ -2644,6 +2819,21 @@ Java_kr_co_iefriends_pcsx2_NativeApp_usbSetDeviceType(JNIEnv* env, jclass, jint 
     if (!si)
         return;
     USB::SetConfigDevice(*si, static_cast<u32>(port), type.c_str());
+    // SingStar (and its Konami/Logitech variants) needs a host audio *input* to read from. On Android
+    // the mic device opens the built-in microphone through Oboe when the configured source is
+    // "cubeb_default" — the backend-neutral marker for "the platform's default device". If the user has
+    // never set one, seed it here so attaching a SingStar port works out of the box instead of failing
+    // with "Neither player 1 nor 2 is connected". Existing configs keep their own values.
+    if (type == "singstar")
+    {
+        const std::string section = USB::GetConfigSection(port);
+        static const char* kDefaultDeviceName = "cubeb_default";
+        for (const char* key : {"input_device_name", "player1_device_name", "player2_device_name"})
+        {
+            if (!USB::ConfigKeyExists(*si, static_cast<u32>(port), "singstar", key))
+                si->SetStringValue(section.c_str(), fmt::format("singstar_{}", key).c_str(), kDefaultDeviceName);
+        }
+    }
     si->Save();
     Console.WriteLnFmt("@@ANDROID_USB@@ port={} type={} index={}", port + 1, type,
         USB::DeviceTypeNameToIndex(type));
@@ -2701,6 +2891,120 @@ Java_kr_co_iefriends_pcsx2_NativeApp_usbSetDeviceSubtype(JNIEnv* env, jclass, ji
     lock.unlock();
     RebuildUsbGenericBinds(static_cast<u32>(port));
     ApplyUsbPortsToRunningVM();
+}
+
+// The phone's microphones, for the one picked in Audio settings: one "<Android device id>\t<name>" per
+// line, where the name is what the settings store (MicDevices.kt). Android lists input devices to Java
+// only, and a device gets a new id each time it is plugged in, so the app sends the list again before
+// every game starts and whenever one comes or goes.
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setMicDevices(JNIEnv* env, jclass, jstring j_list) {
+    if (!j_list)
+        return;
+
+    const char* raw = env->GetStringUTFChars(j_list, nullptr);
+    std::string list(raw ? raw : "");
+    if (raw)
+        env->ReleaseStringUTFChars(j_list, raw);
+
+    std::vector<std::pair<std::string, s32>> devices;
+    size_t start = 0;
+    while (true)
+    {
+        const size_t nl = list.find('\n', start);
+        const std::string line = (nl == std::string::npos) ? list.substr(start) : list.substr(start, nl - start);
+
+        if (!line.empty())
+        {
+            const size_t tab = line.find('\t');
+            if (tab != std::string::npos)
+            {
+                auto parsed = StringUtil::FromChars<s32>(std::string_view(line.data(), tab));
+                if (parsed.has_value())
+                    devices.emplace_back(line.substr(tab + 1), *parsed);
+            }
+        }
+
+        if (nl == std::string::npos)
+            break;
+        start = nl + 1;
+    }
+
+    usb_mic::audiodev_oboe::OboeAudioDevice::SetDeviceList(std::move(devices));
+}
+
+// The microphone test in Audio settings: the capture a game gets (the Oboe source device, at the rate
+// and channel count the emulated mic asks for), reduced to how loud it is.
+static std::mutex s_mic_test_mutex;
+static std::unique_ptr<usb_mic::audiodev_oboe::OboeAudioDevice> s_mic_test;
+static float s_mic_test_level = 0.0f;
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_micTestStart(JNIEnv* env, jclass, jstring j_device) {
+    const char* raw = j_device ? env->GetStringUTFChars(j_device, nullptr) : nullptr;
+    std::string device(raw ? raw : "");
+    if (raw)
+        env->ReleaseStringUTFChars(j_device, raw);
+
+    const std::lock_guard lock(s_mic_test_mutex);
+    s_mic_test.reset();
+    s_mic_test_level = 0.0f;
+
+    // The settings' input gain (decibels), so the test bar shows what a game would receive.
+    if (SettingsInterface* si = Host::Internal::GetBaseSettingsLayer())
+        usb_mic::audiodev_oboe::OboeAudioDevice::SetInputGain(std::pow(10.0f, USB::GetConfigFloat(*si, 0, "singstar", "input_gain", 0.0f) / 20.0f));
+
+    auto test = std::make_unique<usb_mic::audiodev_oboe::OboeAudioDevice>(AUDIODIR_SOURCE, 1, device, 50);
+    if (!test->Start())
+        return false;
+
+    s_mic_test = std::move(test);
+    return true;
+}
+
+// How loud what arrived since the last call was, 0 to 1 over -60 to 0 dBFS; -1 with no test running.
+extern "C"
+JNIEXPORT jfloat JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_micTestLevel(JNIEnv*, jclass) {
+    const std::lock_guard lock(s_mic_test_mutex);
+
+    if (!s_mic_test)
+        return -1.0f;
+
+    std::array<short, 2400> buf{};
+    u64 count = 0;
+    double sum = 0.0;
+
+    while (true)
+    {
+        const uint32_t read = s_mic_test->GetBuffer(buf.data(), static_cast<uint32_t>(buf.size()));
+        for (uint32_t i = 0; i < read; i++)
+            sum += static_cast<double>(buf[i]) * buf[i];
+
+        count += read;
+
+        if (read < buf.size())
+            break;
+    }
+
+    // Nothing new since the last call: keep the last reading rather than flicker to silence.
+    if (count)
+    {
+        const double rms = std::sqrt(sum / static_cast<double>(count)) / 32768.0;
+        s_mic_test_level = static_cast<float>(std::clamp((20.0 * std::log10(std::max(rms, 1e-6)) + 60.0) / 60.0, 0.0, 1.0));
+    }
+
+    return s_mic_test_level;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_micTestStop(JNIEnv*, jclass) {
+    const std::lock_guard lock(s_mic_test_mutex);
+    s_mic_test.reset();
+    s_mic_test_level = 0.0f;
 }
 
 extern "C"
@@ -3288,6 +3592,15 @@ extern "C"
 JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_setAffinityMode(JNIEnv*, jclass, jint mode) {
     g_android_affinity_mode = (mode < 0 || mode > 7) ? 0 : static_cast<int>(mode);
+}
+
+// The IOP thread setting's default for this device (IopThread::DefaultOnForHost): on where the performance tier is two or
+// three cores and the core would run the thread, off elsewhere. The app asks it for a new install and for the one-time
+// move of an existing one, so the rule is the core's and not a copy in Kotlin. Needs no VM.
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_iopThreadDefaultOn(JNIEnv*, jclass, jboolean mtvu) {
+    return IopThread::DefaultOnForHost(IopThread::CurrentHostInfo(), mtvu == JNI_TRUE) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C"
@@ -4271,6 +4584,55 @@ Java_kr_co_iefriends_pcsx2_NativeApp_saveStateToSlot(JNIEnv *env, jclass clazz, 
     if (filename.empty() || !FileSystem::FileExists(filename.c_str()))
         return fail("file_missing");
     Console.WriteLn("@@ANDROID_SAVESTATE@@ slot=%d ok=1", p_slot);
+    return JNI_TRUE;
+}
+
+// A save state written to a file the caller names, for the problem report. It is a plain
+// VMManager::SaveState to that path: it never touches the numbered slots, the autosave or their
+// .backup files, so taking one cannot overwrite anything the player saved. Same guards as
+// saveStateToSlot, for the same reasons (see there): refused while the memory card is busy,
+// because the state does not contain the card image, and refused with no game CRC.
+//
+// Blocks until the zip is on disk. Not from the UI thread.
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_saveStateToPath(JNIEnv *env, jclass clazz, jstring p_path) {
+    const std::string path = GetJavaString(env, p_path);
+    const auto fail = [](const char* reason) -> jboolean {
+        Console.Error("@@ANDROID_SAVESTATE_PATH@@ ok=0 reason=%s mcd_busy=%d crc=%08X serial=%s",
+            reason, MemcardBusy::IsBusy() ? 1 : 0, VMManager::GetDiscCRC(),
+            VMManager::GetDiscSerial().c_str());
+        return JNI_FALSE;
+    };
+    if (path.empty())
+        return fail("empty_path");
+    if (!VMManager::HasValidVM())
+        return fail("no_vm");
+    if (!SaveStatesHaveName())
+        return fail("crc_zero");
+    if (MemcardBusy::IsBusy())
+        return fail("memcard_busy");
+    const ScopedVMPause pause_guard;
+    if (!pause_guard.parked())
+        return fail("cpu_thread_not_parked");
+    // Marshalled to the CPU thread for the reason given in saveStateToSlot: the state download and
+    // the screenshot push to the MTGS ring, which only that thread may do.
+    std::string save_error;
+    Host::RunOnCPUThread([&path, &save_error]() {
+        if (!VMManager::HasValidVM()) {
+            save_error = "VM shut down";
+            return;
+        }
+        VMManager::SaveState(path.c_str(), /*zip_on_thread=*/false, /*backup_old_state=*/false,
+            [&save_error](const std::string& error) { save_error = error; });
+    }, /*block=*/true);
+    if (!save_error.empty()) {
+        Console.Error("saveStateToPath: %s", save_error.c_str());
+        return fail("save_error");
+    }
+    if (!FileSystem::FileExists(path.c_str()))
+        return fail("file_missing");
+    Console.WriteLn("@@ANDROID_SAVESTATE_PATH@@ ok=1");
     return JNI_TRUE;
 }
 

@@ -70,18 +70,53 @@ object LibraryKeyboard {
     const val DONE = "done"
     const val SHIFT = "shift"
 
+    /** Switches between the letters and the punctuation page. Only on keyboards opened with punctuation. */
+    const val SYMBOLS = "symbols"
+
     // This keyboard also fills the settings text fields (DEV9 addresses and DNS, host names, the
     // HDD image path, memory card and game names), so it carries the symbols those need: "." for
     // an address or a file name, "/" for a path, ":" "-" "_" for host names and file names. They
     // sit where a physical keyboard puts them where possible (". /" after "m") and fill the short
     // rows, so the grid keeps its five rows and still fits a landscape handheld.
-    val rows: List<List<String>> = listOf(
+    private val baseRows: List<List<String>> = listOf(
         listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"),
         listOf("q", "w", "e", "r", "t", "y", "u", "i", "o", "p"),
         listOf("a", "s", "d", "f", "g", "h", "j", "k", "l", ":"),
         listOf(SHIFT, "z", "x", "c", "v", "b", "n", "m", ".", "/"),
         listOf("-", "_", SPACE, BACKSPACE, CLEAR, DONE),
     )
+
+    // For free text (a problem report's description), where people write sentences. The letters
+    // page gains a key that switches to a page of the punctuation sentences need, in the same five
+    // rows; the library search keeps the layout above, which is why this is opt-in per open().
+    private val textRows: List<List<String>> = baseRows.dropLast(1) + listOf(listOf(SYMBOLS, "-", "_", SPACE, BACKSPACE, CLEAR, DONE))
+    private val symbolRows: List<List<String>> = listOf(
+        listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"),
+        listOf("'", ",", "?", "!", "(", ")", "@", "#", "+", "="),
+        listOf("&", ":", ";", "\"", "%", "*", "/", ".", "-", "_"),
+        listOf("[", "]", "{", "}", "<", ">", "~", "|", "\\", "`"),
+        listOf(SYMBOLS, "-", "_", SPACE, BACKSPACE, CLEAR, DONE),
+    )
+
+    /** This open() has the punctuation page. */
+    private val punctuation = mutableStateOf(false)
+
+    /** The punctuation page is the one showing. */
+    private val onSymbols = mutableStateOf(false)
+
+    /** The keys on screen now: the plain grid, or the letters or punctuation page of a text keyboard. */
+    val rows: List<List<String>>
+        get() = when {
+            !punctuation.value -> baseRows
+            onSymbols.value -> symbolRows
+            else -> textRows
+        }
+
+    private val fieldMode = mutableStateOf(false)
+    private val keyboardType = mutableStateOf(KeyboardType.Text)
+
+    /** open() switched to the system keyboard for this one entry (touch). Undone by close(). */
+    private var systemImeForced = false
 
     /** Use the Android system IME instead of these on-screen keys. Opt-in: the built-in keyboard
      *  stays the default because it is fully gamepad-navigable, whereas the system IME is not (and
@@ -105,42 +140,47 @@ object LibraryKeyboard {
         return useSystemIme.value
     }
 
-    /** Per-open overrides for a settings field (see [open]). Reset on every open. */
-    private val forceSystemIme = mutableStateOf(false)
-    private val fieldMode = mutableStateOf(false)
-    private val keyboardType = mutableStateOf(KeyboardType.Text)
-
     /**
-     * [systemIme] true = use Android's keyboard for this open even when the "Use system keyboard"
-     * preference is off. Settings fields pass it for a TOUCH tap, so a phone user typing an address
-     * gets the keyboard they expect, while a gamepad confirm still gets the D-pad key grid.
-     * [type] picks the IME layout; a non-null type also marks this as a settings field, which turns
-     * off auto-capitalisation and autocorrect (a capitalised hostname silently never matches) and
-     * shows Done instead of Search.
+     * @param punctuation add the page of punctuation sentences need (' , ? ! ( ) @ # + = &). The
+     *   library search and the settings fields do not ask for it and keep their grid unchanged.
+     * @param systemKeyboard use the system keyboard for this one entry whatever the setting says.
+     *   For a touch user typing a sentence, who has no use for a key grid; a controller user gets the grid.
+     * @param type the system keyboard's layout; a settings field passes one, which also turns off
+     *   auto-capitalisation and autocorrect (a capitalised hostname never matches) and shows Done.
      */
     fun open(
         initial: String,
         onChange: (String) -> Unit,
         placeholder: String = "Search games…",
-        systemIme: Boolean = false,
+        punctuation: Boolean = false,
+        systemKeyboard: Boolean = false,
         type: KeyboardType? = null,
     ) {
         text.value = initial
         this.onChange = onChange
         this.placeholder.value = placeholder
-        forceSystemIme.value = systemIme
+        this.punctuation.value = punctuation
+        onSymbols.value = false
         fieldMode.value = type != null
         keyboardType.value = type ?: KeyboardType.Text
         // Re-read on every open so the preference needs no wiring into app startup, and so a
         // change made in Settings takes effect the next time the keyboard is summoned.
         refreshUseSystemIme()
+        systemImeForced = systemKeyboard
+        if (systemKeyboard) useSystemIme.value = true
         row.intValue = 0
         col.intValue = 0
         shifted.value = false
         visible.value = true
     }
 
-    fun close() { visible.value = false }
+    fun close() {
+        visible.value = false
+        if (systemImeForced) {
+            systemImeForced = false
+            refreshUseSystemIme()
+        }
+    }
 
     fun move(dx: Int, dy: Int) {
         val br = row.intValue; val bc = col.intValue
@@ -163,6 +203,12 @@ object LibraryKeyboard {
         // A tick per key (touch or controller); Done gets the confirm blip.
         com.armsx2.MenuSfx.play(if (key == DONE) com.armsx2.MenuSfx.Event.SELECT else com.armsx2.MenuSfx.Event.NAV)
         if (key == SHIFT) { shifted.value = !shifted.value; return }
+        if (key == SYMBOLS) {
+            onSymbols.value = !onSymbols.value
+            // The last row is the same on both pages, so the cursor stays on this key.
+            col.intValue = col.intValue.coerceIn(0, rows[row.intValue].size - 1)
+            return
+        }
         val next = when (key) {
             SPACE -> text.value + " "
             BACKSPACE -> text.value.dropLast(1)
@@ -180,7 +226,7 @@ object LibraryKeyboard {
     private fun weightOf(key: String): Float = when (key) {
         SPACE -> 3f
         DONE -> 2f
-        BACKSPACE, CLEAR, SHIFT -> 1.6f
+        BACKSPACE, CLEAR, SHIFT, SYMBOLS -> 1.6f
         else -> 1f
     }
 
@@ -190,6 +236,7 @@ object LibraryKeyboard {
         CLEAR -> "Clear"
         DONE -> "Done"
         SHIFT -> "⇧"
+        SYMBOLS -> if (onSymbols.value) "abc" else "#+="
         else -> if (shifted.value) key.uppercase() else key
     }
 
@@ -212,7 +259,7 @@ object LibraryKeyboard {
                 Modifier.padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                if (useSystemIme.value || forceSystemIme.value) {
+                if (useSystemIme.value) {
                     SystemImeField()
                     return@Column
                 }
