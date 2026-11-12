@@ -7,6 +7,9 @@
 #include "Host.h"
 #include "R3000A.h"
 #include "arm64/BaseblockEx-arm64.h"
+#include "arm64/BlockLut-arm64.h"
+#include "arm64/RecCrashReport-arm64.h"
+#include "arm64/RecErrorReport-arm64.h"
 #include "R5900OpcodeTables.h"
 #include "IopBios.h"
 #include "IopHw.h"
@@ -46,6 +49,9 @@ static BASEBLOCK* recROM2 = nullptr;
 static Arm64BaseBlocks recBlocks;
 static u8* recPtr = nullptr;
 static u8* recPtrEnd = nullptr;
+// Where blocks start: the dispatchers and stubs recResetIOP generates come
+// first. For the crash post-mortem.
+static u8* s_blocksStart = nullptr;
 u32 psxpc;
 int psxbranch;
 u32 g_iopCyclePenalty;
@@ -78,8 +84,14 @@ void psxRecompileNextInstruction(bool delayslot, bool swapped_delayslot);
 extern void (*rpsxBSC[64])();
 void rpsxpropBSC(EEINST* prev, EEINST* pinst);
 
-static void iopClearRecLUT(BASEBLOCK* base, int count);
-static void iopRecError(int err);
+// iopRecError's codes.
+enum IopRecErrorCode : u32
+{
+	kIopRecErrorUnmappedPage = 0,
+	kIopRecErrorUnalignedJump = 1, // jump_pc and jump_rs are the jump's; its target is in psxRegs.pc
+	kIopRecErrorUnalignedEntry = 2, // the pc was unaligned at slice entry; the others are unused
+};
+static void iopRecError(u32 err, u32 jump_pc, u32 jump_rs);
 
 #define PSX_GETBLOCK(x) PC_GETBLOCK_(x, psxRecLUT)
 
@@ -89,7 +101,7 @@ static void iopRecError(int err);
 			4)
 
 // LUT page management — same as x86 (architecture-independent)
-static DynamicHeapArray<BASEBLOCK, 4096> recLutReserve;
+static BlockLut recLutReserve;
 static DynamicHeapArray<BASEBLOCK, 4096> recLutUnmapped;
 static size_t recLutEntries = 0;
 static bool extraRam = false;
@@ -432,9 +444,11 @@ static const void* _DynGen_UnmappedRecLUTPage()
 {
 	u8* retval = armGetCurrentCodePointer();
 
-	armAsm->Mov(RWARG1, 0);
+	// Memory current first, for the clock iopRecError logs.
+	iopEmitSpill();
+	armAsm->Mov(RWARG1, kIopRecErrorUnmappedPage);
 	armEmitCall((void*)iopRecError);
-	armEmitJmp(iopExitRecompiledCode);
+	armEmitJmp(iopExitRecompiledCodeSpilled);
 
 	return retval;
 }
@@ -504,19 +518,22 @@ static void _DynGen_Dispatchers()
 	Perf::any.Register(start, static_cast<u32>(armGetCurrentCodePointer() - start), "IOP Dispatcher");
 }
 
-static void iopRecError(int err)
+static void iopRecError(u32 err, u32 jump_pc, u32 jump_rs)
 {
-	switch (err)
+	if (err == kIopRecErrorUnmappedPage)
 	{
-		case 0:
-			Host::ReportErrorAsync("R3000A Exception",
-				fmt::format("Unrecognized opcode (PC: 0x{:08x})", psxRegs.pc));
-			break;
-
-		case 1:
-			Host::ReportErrorAsync("R3000A Exception",
-				fmt::format("Jump to unaligned address (PC: 0x{:08x})", psxRegs.pc));
-			break;
+		Host::ReportErrorAsync("R3000A Exception",
+			fmt::format("Jump to unmapped recLUT page (PC: 0x{:08x})", psxRegs.pc));
+		RecErrorReport::LogIop(RecErrorReport::Kind::UnmappedPage, std::nullopt);
+	}
+	else
+	{
+		Host::ReportErrorAsync("R3000A Exception",
+			fmt::format("Jump to unaligned address (PC: 0x{:08x})", psxRegs.pc));
+		std::optional<RecErrorReport::Jump> jump;
+		if (err == kIopRecErrorUnalignedJump)
+			jump = RecErrorReport::Jump{jump_pc, jump_rs, psxRegs.pc};
+		RecErrorReport::LogIop(RecErrorReport::Kind::UnalignedJump, jump);
 	}
 
 	EeBridge::RequestPause();
@@ -836,7 +853,7 @@ void psxRecompileIrxImport()
 //  Branch handling
 // =====================================================================================================
 
-void psxSetBranchReg()
+void psxSetBranchReg(u32 jump_pc, u32 jump_rs)
 {
 	psxbranch = 1;
 
@@ -860,10 +877,15 @@ void psxSetBranchReg()
 
 	armEmitJmp(iopDispatcherReg);
 
+	// Memory current first, for the clock iopRecError logs. The target it
+	// reports is the one stored to psxRegs.pc above.
 	armAsm->Bind(&unaligned);
-	armAsm->Mov(RWARG1, 1);
+	iopEmitSpill();
+	armAsm->Mov(a64::w1, jump_pc);
+	armAsm->Mov(a64::w2, jump_rs);
+	armAsm->Mov(RWARG1, kIopRecErrorUnalignedJump);
 	armEmitCall((void*)iopRecError);
-	armEmitJmp(iopExitRecompiledCode);
+	armEmitJmp(iopExitRecompiledCodeSpilled);
 }
 
 void psxSetBranchImm(u32 imm)
@@ -1444,12 +1466,6 @@ void iopStoreClearHit(u32 addr)
 	recClearIOP((addr & 0x1fffffff) & ~3u, 1);
 }
 
-static void iopClearRecLUT(BASEBLOCK* base, int count)
-{
-	for (int i = 0; i < count / 4; i++)
-		base[i].SetFnptr((uptr)iopJITCompile);
-}
-
 // =====================================================================================================
 //  Reserve / Reset / Shutdown / Execute
 // =====================================================================================================
@@ -1459,8 +1475,7 @@ static void recReserveRAM()
 	recLutEntries =
 		((Ps2MemSize::ExposedIopRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2) / 4);
 
-	if (recLutReserve.size() != recLutEntries)
-		recLutReserve.resize(recLutEntries);
+	recLutReserve.Resize(recLutEntries);
 
 	recLutUnmapped.resize(_64kb / 4);
 
@@ -1515,9 +1530,9 @@ void recResetIOP()
 	armStartBlock();
 	_DynGen_Dispatchers();
 	recPtr = armEndBlock();
+	s_blocksStart = recPtr;
 
-	iopClearRecLUT(reinterpret_cast<BASEBLOCK*>(recLutReserve.data()),
-		Ps2MemSize::ExposedIopRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2);
+	recLutReserve.Reset((uptr)iopJITCompile);
 
 	BASEBLOCK* unmapped = recLutUnmapped.data();
 
@@ -1585,18 +1600,54 @@ void recResetIOP()
 static void recShutdown()
 {
 	s_iopConstantPool.Destroy();
-	recLutReserve.deallocate();
+	recLutReserve.Free();
 
 	safe_free(s_pInstCache);
 	s_nInstCacheSize = 0;
 
 	recPtr = nullptr;
 	recPtrEnd = nullptr;
+	s_blocksStart = nullptr;
+}
+
+RecCrashReport::RecSlices RecCrashReport::IopSlices()
+{
+	RecSlices slices;
+	slices.blocks_start = reinterpret_cast<uptr>(s_blocksStart);
+	// recReserve puts the code region's end one slop below the constant pool.
+	slices.pool_start = recPtrEnd ? reinterpret_cast<uptr>(recPtrEnd) + _64kb : 0;
+	return slices;
+}
+
+bool RecCrashReport::FindIopBlock(uptr host_pc, BlockHit* hit)
+{
+	const BASEBLOCKEX* block = recBlocks.FindByHostPc(host_pc);
+	if (!block)
+		return false;
+	hit->guest_pc = block->startpc;
+	hit->guest_words = block->size;
+	hit->host_start = block->fnptr;
+	hit->host_size = block->x86size;
+	return true;
 }
 
 static __noinline s32 recExecuteBlock(s32 eeCycles)
 {
 	psxRegs.iopBreak = 0;
+
+	// iopDispatcherReg finds a block with an 8-byte load at pc * 2 into the
+	// page's table, which reads the right entry only when pc is a multiple of
+	// 4. A jump to an unaligned address leaves the slice with pc at that
+	// address (psxSetBranchReg), and the IOP stays there: each slice reports it
+	// again and runs nothing. The slice says it used its whole budget, because
+	// the IOP thread runs a slice that used none again at once.
+	if (psxRegs.pc & 3) [[unlikely]]
+	{
+		iopRecError(kIopRecErrorUnalignedEntry, 0, 0);
+		psxRegs.iopCycleEE = 0;
+		return 0;
+	}
+
 	psxRegs.iopCycleEE = eeCycles;
 
 	((void (*)())iopEnterRecompiledCode)();

@@ -578,6 +578,8 @@ static inline ShaderConvertSelector GetConvertShaderMask(const GSTexture* src, c
 	return GetConvertShaderMask(src->GetFormat(), dst->GetFormat(), src_bpp, dst_bpp, red, green, blue, alpha);
 }
 
+// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 enum ChannelFetch
 {
 	ChannelFetch_NONE  = 0,
@@ -602,6 +604,7 @@ enum class HWBlendType
 	BMIX1_SRC_HALF          = 2, // Impossible blend will always be wrong on hw, divide Cs by 2.
 	BMIX2_OVERFLOW          = 3, // Blending Cs might overflow, try to compensate.
 };
+// TFX pipeline key layout: end.
 
 struct alignas(16) DisplayConstantBuffer
 {
@@ -696,6 +699,8 @@ struct HWBlend
 
 struct alignas(16) GSHWDrawConfig
 {
+	// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+	// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 	enum class Topology: u8
 	{
 		Point,
@@ -982,6 +987,7 @@ struct alignas(16) GSHWDrawConfig
 	};
 	static_assert(sizeof(PSSelector) == 16, "PSSelector is 12 bytes");
 #pragma pack(pop)
+	// TFX pipeline key layout: end.
 	struct PSSelectorHash
 	{
 		std::size_t operator()(const PSSelector& p) const
@@ -1051,6 +1057,8 @@ struct alignas(16) GSHWDrawConfig
 			return (triln >= static_cast<u8>(GS_MIN_FILTER::Nearest_Mipmap_Nearest));
 		}
 	};
+	// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+	// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 	struct DepthStencilSelector
 	{
 		union
@@ -1102,6 +1110,7 @@ struct alignas(16) GSHWDrawConfig
 		constexpr ColorMaskSelector(): key(0xF) {}
 		constexpr ColorMaskSelector(u8 c): key(0) { wrgba = c; }
 	};
+	// TFX pipeline key layout: end.
 
 #pragma pack(pop)
 	struct alignas(16) VSConstantBuffer
@@ -1257,6 +1266,8 @@ struct alignas(16) GSHWDrawConfig
 		}
 	};
 	// For hardware rendering backends
+	// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+	// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 	struct BlendState
 	{
 		typedef u8 BlendOp; /*GSDevice::BlendOp*/
@@ -1295,6 +1306,7 @@ struct alignas(16) GSHWDrawConfig
 		// Blending has no effect if RGB is masked.
 		bool IsEffective(ColorMaskSelector colormask) const;
 	};
+	// TFX pipeline key layout: end.
 
 	enum class AlphaTestMode
 	{
@@ -1432,6 +1444,20 @@ struct alignas(16) GSHWDrawConfig
 	/// scale, then resolve back with point sampling. Set only for +-1 counter draws, and only when
 	/// the device reports native_counter_draws. See GSRendererHW::IsColClipCounterDraw().
 	float colclip_native_scale;
+
+	/// A colour-wrap counter draw counted in the stencil buffer instead of the colour-clip copy (see
+	/// GSRendererHW::SetupStencilCounterDraw). The indices are sorted by the sign of the step: the
+	/// primitives before `minus_start` add +step to the written colour channels, the rest -step, and
+	/// primitives that add nothing are left out when nothing else of theirs is written. The backend
+	/// draws the two runs with stencil INCR_WRAP and DECR_WRAP (colour writes limited to alpha, which
+	/// the draw writes as usual), then adds step * count mod 256 into the RGB channels the colour mask
+	/// enables. Only set when the device reports stencil_counter.
+	struct StencilCounter
+	{
+		u32 minus_start; ///< First index of the -step primitives.
+		u8 step[3];      ///< The +step per RGB channel, in the target's 8-bit units (0x08 on a 16-bit target); 0 where unwritten.
+		bool enable;
+	} stencil_counter;
 
 	VSConstantBuffer cb_vs;
 	PSConstantBuffer cb_ps;
@@ -1613,7 +1639,10 @@ public:
 		bool broken_mad_deinterlace : 1; ///< Driver can't reliably preserve/read the two-bank FastMAD history target.
 		bool broken_blend_constant : 1; ///< Driver applies a CONST_COLOR / INV_CONST_COLOR blend factor as if the constant were zero. A fixed (AFIX) factor rides the second fragment output instead -- see GSBlendConstantPolicy.h.
 		bool native_counter_draws : 1; ///< Can draw a fresh convert-and-resolve colclip draw at native resolution (GSHWDrawConfig::colclip_native_scale).
+		bool stencil_counter : 1; ///< Can count a colour-wrap counter draw in the stencil buffer and add the count into the target (GSHWDrawConfig::stencil_counter). Vulkan only: needs the stencil buffer and a sampled stencil aspect.
+		bool destination_alpha_loop : 1; ///< Copy road for self-reads, except a destination-alpha draw in the stencil-one mode, which reads the target in the pass under a declared feedback loop with one barrier instead of building its stencil in a setup pass. Vulkan only (Turnip on the Adreno 613); see GSSelfReadRoadPolicy.h.
 		GSFeedbackCarry feedback_carry; ///< Which draws may keep the open pass's feedback-loop bits. Vulkan only; see GSDrawRoad.h.
+		u8 sub_texel_precision_bits; ///< Fractional bits the sampler keeps of a texel coordinate (Vulkan's subTexelPrecisionBits), so how far it may round one. 0 = not known; read as Vulkan's minimum, 4.
 		FeatureSupport()
 		{
 			memset(this, 0, sizeof(*this));
@@ -1656,6 +1685,8 @@ public:
 	};
 	using RecycledTexture = std::unique_ptr<GSTexture, TextureRecycleDeleter>;
 
+	// TFX pipeline key layout: begin. cmake/GSKeyLayoutId.cmake hashes what lies between these markers to name
+	// the recorded key lists (GSDeviceVK::SetGameIdentity): a change here means old keys describe other pipelines.
 	enum BlendFactor : u8
 	{
 		// HW blend factors
@@ -1669,10 +1700,14 @@ public:
 		// HW blend operations
 		OP_ADD, OP_SUBTRACT, OP_REV_SUBTRACT
 	};
+	// TFX pipeline key layout: end.
 	// clang-format on
 
 protected:
 	std::string m_name = "Unknown";
+	/// Why Create() failed, when the backend knows and has not reported it itself. GSopen adds it
+	/// to its "Failed to create render device" report.
+	std::string m_create_error;
 	FeatureSupport m_features;
 	u32 m_max_texture_size = 0;
 	// ★ Unknown, NOT Adreno. Defaulting to a real vendor meant every backend that never calls
@@ -1877,6 +1912,9 @@ public:
 	/// Returns a string containing current adapter in use.
 	const std::string& GetName() const { return m_name; }
 
+	/// Why Create() failed, or empty. See m_create_error.
+	const std::string& GetCreateError() const { return m_create_error; }
+
 	GSTexture* GetColorClipTexture() const { return m_colclip_rt; }
 		
 	void SetColorClipTexture(GSTexture* tex) { m_colclip_rt = tex; }
@@ -1935,6 +1973,7 @@ public:
 	static int GetMipmapLevelsForSize(int width, int height);
 
 	__fi u64 GetPoolMemoryUsage() const { return m_pool_memory_usage; }
+	__fi u32 GetFrame() const { return m_frame; }
 
 	__fi FeatureSupport Features() const { return m_features; }
 	__fi u32 GetMaxTextureSize() const { return m_max_texture_size; }

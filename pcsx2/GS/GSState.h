@@ -78,7 +78,7 @@ private:
 
 	void GIFPackedRegHandlerNull(const GIFPackedReg* RESTRICT r);
 	void GIFPackedRegHandlerRGBA(const GIFPackedReg* RESTRICT r);
-	void GIFPackedRegHandlerSTQ(const GIFPackedReg* RESTRICT r);
+	template <bool KeepGifQ> void GIFPackedRegHandlerSTQ(const GIFPackedReg* RESTRICT r);
 	void GIFPackedRegHandlerUV(const GIFPackedReg* RESTRICT r);
 	void GIFPackedRegHandlerUV_Hack(const GIFPackedReg* RESTRICT r);
 	template<u32 prim, u32 adc, bool auto_flush> void GIFPackedRegHandlerXYZF2(const GIFPackedReg* RESTRICT r);
@@ -105,7 +105,7 @@ private:
 
 	void GIFRegHandlerNull(const GIFReg* RESTRICT r);
 	void GIFRegHandlerPRIM(const GIFReg* RESTRICT r);
-	void GIFRegHandlerRGBAQ(const GIFReg* RESTRICT r);
+	template <bool KeepGifQ> void GIFRegHandlerRGBAQ(const GIFReg* RESTRICT r);
 	void GIFRegHandlerST(const GIFReg* RESTRICT r);
 	void GIFRegHandlerUV(const GIFReg* RESTRICT r);
 	void GIFRegHandlerUV_Hack(const GIFReg* RESTRICT r);
@@ -215,6 +215,7 @@ protected:
 	{
 		for (GIFPackedRegHandlerC& e : m_fpGIFPackedRegHandlersLayoutC)
 			e = nullptr;
+		m_kick_published_prim = 0xFF;
 	}
 
 	// Executor-owned HOST->LOCAL write cursor (advanced by wi() across transfer
@@ -231,15 +232,19 @@ protected:
 	int  m_used_buffers_idx = 0;
 	int m_current_buffer_idx = 0;
 	bool m_recent_buffer_switch = false;
+	// The primitive type whose kick handlers UpdateVertexKick last published into the handler tables, or 0xFF when
+	// the tables hold none (ResetHandlers empties them). ApplyPRIM skips the republish when the type is unchanged.
+	u8 m_kick_published_prim = 0xFF;
 
 	// Definitions hoisted to GSBackQueue.h (DRAW record payload types).
 	using GSVertexBuff = GSBackQueue::VertexBuff;
 	using GSIndexBuff = GSBackQueue::IndexBuff;
 
-	GSVertexBuff m_vertex_buffers[MAX_DRAW_BUFFERS];
+	// Zeroed, so the constructor's first ResetDrawBuffers() frees nothing.
+	GSVertexBuff m_vertex_buffers[MAX_DRAW_BUFFERS] = {};
 	GSVertexBuff* m_vertex = nullptr;
 
-	GSIndexBuff m_index_buffers[MAX_DRAW_BUFFERS];
+	GSIndexBuff m_index_buffers[MAX_DRAW_BUFFERS] = {};
 
 	GSIndexBuff* m_index;
 
@@ -290,8 +295,12 @@ protected:
 
 	void UpdateVertexKick();
 
+	/// The most vertices a draw buffer slot may hold: 64 times a draw's own vertex limit (65,532 for most classes), so
+	/// only a runaway reaches it. GrowVertexBuffer fails loudly there instead of allocating.
+	static constexpr u32 MAX_VERTEX_CAPACITY = 1u << 22;
 	void GrowVertexBuffer();
 	bool IsAutoFlushDraw(u32 prim, int& tex_layer);
+	template <bool check_shuffle> bool IsAutoFlushDrawImpl(u32 prim, int& tex_layer);
 	template<u32 prim> void HandleAutoFlush();
 	bool EarlyDetectShuffle(u32 prim);
 	void CheckCLUTValidity(u32 prim);
@@ -415,9 +424,9 @@ protected:
 		if (shift == 4)
 			return GSVertexKernels::MakeCullMirrorEntry<true>(wx, wy, m_cull_bounds_band, 4);
 
-		// shift 0 means this class has no grid, so nothing reads the bands; pack
-		// them at the native width rather than at a degenerate one.
-		return GSVertexKernels::MakeCullMirrorEntry<false>(wx, wy, m_cull_bounds_raw, (shift != 0) ? shift : 4,
+		// A rounded class with no grid packs TrimKey bands (shift 0). Point and line
+		// never read the bands; pack them at the native width.
+		return GSVertexKernels::MakeCullMirrorEntry<false>(wx, wy, m_cull_bounds_raw, rounded ? shift : 4,
 			m_cull_grid.band_bias_x, m_cull_grid.band_bias_y);
 	}
 
@@ -457,6 +466,8 @@ protected:
 	template<u32 prim, GSVertexKernels::PackedLayout layout, bool auto_flush> void KickPackedBatchKernel(const GIFPackedReg* RESTRICT r, u32 count);
 	template<u32 prim, GSVertexKernels::PackedLayout layout> void KickPackedOneStaged(const GIFPackedReg* RESTRICT rv);
 	template<u32 prim, GSVertexKernels::PackedLayout layout> void KickPackedStagedRun(const GIFPackedReg* RESTRICT r, u32 count);
+	void SnapshotDrawEnvironment();
+	void SnapshotDrawEnvironmentForChunk();
 	template<u32 prim, GSVertexKernels::PackedLayout layout> void KickPackedOneLegacy(const GIFPackedReg* RESTRICT rv, u64 uvfog, GSLimit24BitDepth depth_clamp);
 	template<u32 prim> bool KickKernelApplies();
 	// Which (prim, layout) pairs stage 3c instantiates a fused handler for.
@@ -491,9 +502,11 @@ protected:
 		else if constexpr (prim == GS_SPRITE)
 		{
 			// spiderman3's whole sprite stream: {ST, XYZ2} 25,368 calls and
-			// {UV, XYZ2} 1,796.
+			// {UV, XYZ2} 1,796; and Call of Duty 3's {UV, XYZF2}, about 21,000
+			// vertices a vsync that went through the per-qword replay before.
 			return layout == GSVertexKernels::PackedLayout::PairSTQXYZ2 ||
-				   layout == GSVertexKernels::PackedLayout::PairUVXYZ2;
+				   layout == GSVertexKernels::PackedLayout::PairUVXYZ2 ||
+				   layout == GSVertexKernels::PackedLayout::PairUVXYZF2;
 		}
 		else
 		{
@@ -504,15 +517,17 @@ protected:
 	// And which of those enter the two-pass kernel, which is the expensive half:
 	// RunChunk, its driver and its seam kick are about 9 KB of .text a pair.
 	//
-	// Sprites never enter it -- they are auto_flush = true at both GameDB levels
-	// and under the software renderer, so they stay on the staged loop, and
-	// 27,164 sprite handler calls across the corpus produced ZERO kernel entries.
 	// Both triangle-strip pairs enter it -- the NOP-padded triple 12,214 times
-	// and {RGBAQ, XYZ2} 11,600 -- and that is all of it.
+	// and {RGBAQ, XYZ2} 11,600 across the corpus -- and so do the two sprite
+	// pairs. Sprites are auto_flush = true at both GameDB levels and under the
+	// software renderer, so their chunks are routed: the chunk routing asks the
+	// autoflush predicate without its shuffle test, which is exact, because the
+	// shuffle test can only turn a true answer false, so a chunk for which the
+	// rest of the predicate is false is false for every vertex in it.
 	template <u32 prim, GSVertexKernels::PackedLayout layout>
 	static constexpr bool LayoutUsesKernel()
 	{
-		return prim == GS_TRIANGLESTRIP && LayoutHandlerExists<prim, layout>();
+		return (prim == GS_TRIANGLESTRIP || prim == GS_SPRITE) && LayoutHandlerExists<prim, layout>();
 	}
 
 	// The fused handler for a (prim, layout) pair, or null when the corpus shows
@@ -570,6 +585,9 @@ protected:
 	// must not touch the vertices: the console's plane is the same at every Z, and the
 	// rounding only fires under a constant one. Software renderer on ARM64 only.
 	virtual bool BuildsConsolePlane() { return false; }
+	/// True when the renderer resolves this draw's S, T and Q itself and the front
+	/// end's texel rounding (GSState.cpp) must leave the GIF's words alone.
+	virtual bool SkipsTexelRounding() { return BuildsConsolePlane(); }
 	// Which auto-flush rule ResetHandlers arms. The decision belongs to the renderer's DRAW
 	// ENGINE, not the process's renderer type: a renderer can run the SW engine as a fallback
 	// floor under a hardware GSCurrentRenderer, and the two flush shapes produce different
@@ -837,6 +855,12 @@ public:
 	void FlushBuffers(bool flush_base_only = false, bool use_flush_reason = false, GSFlushReason flush_reason = GSFlushReason::CONTEXTCHANGE);
 	void PushBuffer();
 	void SetDrawBufferEnv();
+	// The environment a buffered draw was built with. With draw buffering off the
+	// draw's only copy is m_prev_env (see SetDrawBufferEnv).
+	__fi const GSDrawingEnvironment& BufferEnv(int i) const
+	{
+		return GSConfig.UserHacks_DrawBuffering ? m_env_buffers[i].m_env : m_prev_env;
+	}
 	void SetDrawBuffDirty();
 	bool CanBufferNewDraw();
 	void Flush(GSFlushReason reason);
@@ -844,10 +868,23 @@ public:
 	u32 CalcMask(int exp, int max_exp);
 	void FlushPrim();
 	bool TestDrawChanged();
-	void FlushWrite();
+	__fi void FlushWrite()
+	{
+		if (m_tr.write)
+			FlushWriteSlow();
+	}
+	void FlushWriteSlow();
 	virtual void Draw() = 0;
+	/// Called by the draw executor before the vertex trace. A renderer that can stand in for Draw() with
+	/// what it recorded when an earlier draw asked for the same thing (the hardware renderer's burst memo,
+	/// GSRendererHWBurstMemo.cpp) does so and returns true; the executor then skips the vertex trace, the
+	/// texel rounding and Draw(), and keeps its own bookkeeping.
+	virtual bool SkipMemoizedDraw() { return false; }
 	virtual void PurgeTextureCache(bool sources, bool targets, bool hash_cache);
 	virtual void ReadbackTextureCache();
+	/// Writes into local memory what the hardware renderer holds for it apart from its targets (moved depth
+	/// words, GSTextureCache::MaterialiseHeldPages), for anything that takes local memory as it stands.
+	virtual void MaterialiseHeldLocalMemory() {}
 	virtual void InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r) {}
 	virtual void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) {}
 
@@ -943,8 +980,10 @@ public:
 	void ExecRecordSlot(const GSBackQueue::RecordSlot& slot);
 	virtual void ExecVsyncRecord(const GSBackQueue::VsyncRecord& rec);
 
-	template <typename T>
-	void PushRecord(GSBackQueue::RecordType type, const T& rec)
+	// Pushes a record built in place: `fill` writes it straight into the ring slot. A draw record is 1,664 bytes, so
+	// building it on the stack and copying it into the slot cost a third of the record's copying.
+	template <typename T, typename Fill>
+	void PushRecordInPlace(GSBackQueue::RecordType type, Fill&& fill)
 	{
 		// One producer: the ring is single-producer, and the MTGS thread is the only one allowed.
 		pxAssert(std::this_thread::get_id() == m_chan->drain_thread);
@@ -954,7 +993,7 @@ public:
 			if (slot)
 			{
 				slot->type = type;
-				std::memcpy(slot->As<T>(), &rec, sizeof(T));
+				fill(*slot->As<T>());
 				m_chan->ring.CommitPush();
 				m_chan->sema.NotifyOfWork();
 				break;
@@ -964,6 +1003,12 @@ public:
 				return GSBackQueue::RecordRing::Capacity() - m_chan->ring.Size() >= GSBackQueue::Channel::kRingRefill;
 			});
 		}
+	}
+
+	template <typename T>
+	void PushRecord(GSBackQueue::RecordType type, const T& rec)
+	{
+		PushRecordInPlace<T>(type, [&rec](T& dst) { std::memcpy(&dst, &rec, sizeof(T)); });
 	}
 
 	GSVector4i GetTEX0Rect(GSDrawingContext prev_ctx);
@@ -1059,15 +1104,22 @@ public:
 	// nothing at all on the shipped path.
 	GIFPackedLayout m_packed_layout = {3, 0, 1, 2};
 
-	// LAST IN THE CLASS ON PURPOSE, and it must stay last. This is 2 KB of scratch
-	// that only the kernel touches. Declared anywhere else it pushes every member
-	// after it 2 KB further from `this`, which moves hot fields the rest of the
-	// front end reads -- for no benefit to anything, since nothing but the kernel
-	// reads these. Declared in the middle of the class it cost the autoflush
-	// handler, which never runs the kernel, measurable time on both the M2 and the
-	// SD865.
-	alignas(16) u64 m_kick_side_xyp[GSVertexKickKernel::kChunkVertices] = {};
-	alignas(16) u64 m_kick_side_meta[GSVertexKickKernel::kChunkVertices] = {};
+	// Whether the parse leaves a zero or NaN-looking Q as the GIF wrote it, instead of
+	// the long-standing fix-ups (Q == +0 to FLT_MIN or 1.0, a NaN to FLT_MAX). Decided by
+	// the renderer before it calls ResetHandlers; the front parser takes the back's.
+	bool m_keep_gif_q = false;
+
+	// The packed parse's constants for that choice, built by ResetHandlers. A member so
+	// the per-vertex parse loads them off `this` with no test of the flag.
+	GSVertexKernels::PackedParseConsts m_parse_consts;
+
+	// The draw record's two environments as the pipelined split's back object holds them: on the front parser
+	// object, what it last sent (it sends only the 64-byte blocks that differ from these); on the back object, those
+	// blocks applied, from which it installs m_prev_env and m_env in full. Behind the kernel's scratch, for the same
+	// reason the scratch is behind everything else: only the record touches them.
+	GSDrawingEnvironment m_rec_env[2] = {};
+	// Front side: m_rec_env holds what the back holds. False until the first draw record, which carries everything.
+	bool m_rec_env_valid = false;
 
 };
 

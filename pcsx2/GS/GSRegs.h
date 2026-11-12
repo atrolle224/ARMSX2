@@ -77,7 +77,8 @@ enum GIF_REG_COMPLEX
 	GIF_REG_UVXYZ2 = 0x04,
 	GIF_REG_RGBAQXYZ2 = 0x05,
 	GIF_REG_UVRGBAQXYZF2 = 0x06,
-	GIF_REG_COMPLEX_COUNT = 0x07,
+	GIF_REG_UVXYZF2 = 0x07,
+	GIF_REG_COMPLEX_COUNT = 0x08,
 };
 
 enum GIF_A_D_REG
@@ -1169,6 +1170,8 @@ struct alignas(32) GIFPath
 		// {UV, RGBAQ, XYZF2}, contiguous or NOP-padded: ST and the latched Q are
 		// carried, the UV and the colour come from the record.
 		TYPE_UVRGBAQXYZF2,
+		// {UV, XYZF2}: Call of Duty 3's sprite stream. ST, colour and Q carried, as {UV, XYZ2}.
+		TYPE_UVXYZF2,
 	};
 
 	static_assert(TYPE_STQRGBAXYZF2 - TYPE_STQRGBAXYZF2 == GIF_REG_STQRGBAXYZF2);
@@ -1178,6 +1181,7 @@ struct alignas(32) GIFPath
 	static_assert(TYPE_UVXYZ2 - TYPE_STQRGBAXYZF2 == GIF_REG_UVXYZ2);
 	static_assert(TYPE_RGBAQXYZ2 - TYPE_STQRGBAXYZF2 == GIF_REG_RGBAQXYZ2);
 	static_assert(TYPE_UVRGBAQXYZF2 - TYPE_STQRGBAXYZF2 == GIF_REG_UVRGBAQXYZF2);
+	static_assert(TYPE_UVXYZF2 - TYPE_STQRGBAXYZF2 == GIF_REG_UVXYZF2);
 
 	__forceinline void SetTag(const void* mem)
 	{
@@ -1206,7 +1210,16 @@ struct alignas(32) GIFPath
 
 		if (tag.FLG == GIF_FLG_PACKED)
 		{
-			if (regs.eq8(GSVector4i(0x0e0e0e0e)).mask() == (1 << nreg) - 1)
+#if defined(ARCH_ARM64)
+			// Every register nibble is A+D, checked on the packed word to avoid a movemask on NEON.
+			u64 regs64;
+			std::memcpy(&regs64, &src->REGS, sizeof(regs64));
+			const u64 used = (nreg == 16) ? ~0ULL : ((1ULL << (nreg * 4)) - 1);
+			const bool ad_only = ((regs64 ^ 0xEEEEEEEEEEEEEEEEULL) & used) == 0;
+#else
+			const bool ad_only = regs.eq8(GSVector4i(0x0e0e0e0e)).mask() == (1 << nreg) - 1;
+#endif
+			if (ad_only)
 			{
 				type = TYPE_ADONLY;
 			}
@@ -1228,6 +1241,8 @@ struct alignas(32) GIFPath
 							type = TYPE_UVXYZ2;
 						else if (regs.U32[0] == 0x00000501)
 							type = TYPE_RGBAQXYZ2;
+						else if (regs.U32[0] == 0x00000403)
+							type = TYPE_UVXYZF2;
 						if (type != TYPE_UNKNOWN)
 							layout = {2, 0, 0, 1};
 						break;
@@ -1260,6 +1275,8 @@ struct alignas(32) GIFPath
 							type = TYPE_UVXYZ2;
 						else if (regs.U32[0] == 0x05010501)
 							type = TYPE_RGBAQXYZ2;
+						else if (regs.U32[0] == 0x04030403)
+							type = TYPE_UVXYZF2;
 						if (type != TYPE_UNKNOWN)
 						{
 							nreg = 2;

@@ -66,6 +66,9 @@ fun NetworkTab(state: MutableState<Settings>) {
     // 0 Online / 1 Host / 2 Join — derived from the stored settings rather than kept as its own
     // field, so there is a single source of truth and no way for the two to disagree.
     val netMode = if (s.network.dev9EthApi != "Local Link") 0 else if (s.network.localLinkHost) 1 else 2
+    val dnsModes = listOf("Manual", "Auto", "Internal")
+    val dns1Index = dnsModes.indexOf(s.network.dev9ModeDns1).let { if (it >= 0) it else 1 }
+    val dns2Index = dnsModes.indexOf(s.network.dev9ModeDns2).let { if (it >= 0) it else 1 }
 
     fun apply(updated: Settings) = InGameOverlay.saveSettings(updated)
 
@@ -234,10 +237,104 @@ fun NetworkTab(state: MutableState<Settings>) {
         // Local Link assigns those itself from the peer id, so showing them in LAN mode would be
         // presenting settings that silently do nothing.
         if (netMode == 0) {
-            DhcpSection(s) { apply(it) }
-            Spacer(Modifier.height(12.dp))
-            InternalDnsSection(s) { apply(it) }
-            Spacer(Modifier.height(12.dp))
+        ToggleRow(str("network.interceptDhcp"), s.network.dev9InterceptDhcp, field = "dev9InterceptDhcp") {
+            apply(s.copy(network = s.network.copy(dev9InterceptDhcp = it)))
+        }
+        SettingsDivider()
+        ToggleRow(str("network.autoSubnetMask"), s.network.dev9AutoMask, field = "dev9AutoMask") {
+            apply(s.copy(network = s.network.copy(dev9AutoMask = it)))
+        }
+        SettingsDivider()
+        ToggleRow(str("network.autoGateway"), s.network.dev9AutoGateway, field = "dev9AutoGateway") {
+            apply(s.copy(network = s.network.copy(dev9AutoGateway = it)))
+        }
+        SettingsDivider()
+        SegmentedRow(
+            label = str("network.primaryDns"),
+            options = dnsModes,
+            selectedIndex = dns1Index,
+            onChange = { apply(s.copy(network = s.network.copy(dev9ModeDns1 = dnsModes[it]))) },
+            field = "dev9ModeDns1",
+        )
+        SettingsDivider()
+        SegmentedRow(
+            label = str("network.secondaryDns"),
+            options = dnsModes,
+            selectedIndex = dns2Index,
+            onChange = { apply(s.copy(network = s.network.copy(dev9ModeDns2 = dnsModes[it]))) },
+            field = "dev9ModeDns2",
+        )
+        SettingsDivider()
+        EditableTextRow(str("network.ps2Ip"), s.network.dev9Ps2Ip) {
+            apply(s.copy(network = s.network.copy(dev9Ps2Ip = it.ifEmpty { "0.0.0.0" })))
+        }
+        SettingsDivider()
+        EditableTextRow(str("network.subnetMask"), s.network.dev9Mask) {
+            apply(s.copy(network = s.network.copy(dev9Mask = it.ifEmpty { "0.0.0.0" })))
+        }
+        SettingsDivider()
+        EditableTextRow(str("network.gateway"), s.network.dev9Gateway) {
+            apply(s.copy(network = s.network.copy(dev9Gateway = it.ifEmpty { "0.0.0.0" })))
+        }
+        SettingsDivider()
+        // The core reads a DNS address only in Manual mode, and Auto gives the PS2 no DNS on
+        // Android at all (#379). So typing an address switches that slot to Manual: left on Auto,
+        // a revival server's DNS was saved and then silently ignored.
+        EditableTextRow(str("network.dns1"), s.network.dev9Dns1) {
+            val ip = it.ifEmpty { "0.0.0.0" }
+            val mode = if (ip != "0.0.0.0") "Manual" else s.network.dev9ModeDns1
+            apply(s.copy(network = s.network.copy(dev9Dns1 = ip, dev9ModeDns1 = mode)))
+        }
+        SettingsDivider()
+        EditableTextRow(str("network.dns2"), s.network.dev9Dns2) {
+            val ip = it.ifEmpty { "0.0.0.0" }
+            val mode = if (ip != "0.0.0.0") "Manual" else s.network.dev9ModeDns2
+            apply(s.copy(network = s.network.copy(dev9Dns2 = ip, dev9ModeDns2 = mode)))
+        }
+        SettingsDivider()
+        HelpText(str("network.hostMappings.help"))
+        // The entries are answered only by the internal DNS server, which the PS2 is pointed at only
+        // when DNS 1 or DNS 2 is Internal. Say so beside them rather than let them sit unused.
+        if (s.network.dev9EthHosts.any { it.enabled } &&
+            s.network.dev9ModeDns1 != "Internal" && s.network.dev9ModeDns2 != "Internal")
+            HelpText(str("network.hostMappings.needsInternal"), Modifier.padding(top = 2.dp))
+        run {
+            val hosts = s.network.dev9EthHosts
+            fun save(list: List<Dev9HostMapping>) = apply(s.copy(network = s.network.copy(dev9EthHosts = list)))
+            fun edit(i: Int, change: (Dev9HostMapping) -> Dev9HostMapping) =
+                save(hosts.toMutableList().also { it[i] = change(it[i]) })
+            hosts.forEachIndexed { i, entry ->
+                Text(
+                    "${str("network.host")} ${i + 1}" + if (entry.name.isNotBlank()) ": ${entry.name}" else "",
+                    color = Colors.pasx2_blue,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    modifier = Modifier.padding(top = 8.dp, bottom = 2.dp),
+                )
+                EditableTextRow(str("network.host.name"), entry.name, emptyText = str("network.host.noName"), focusId = "host$i.name") { v ->
+                    edit(i) { it.copy(name = v) }
+                }
+                // Clearing the hostname removes the entry, as Remove does: an entry with no hostname
+                // matches nothing and is dropped when settings are read back anyway.
+                EditableTextRow(str("network.host.hostname"), entry.url, emptyText = "", focusId = "host$i.url") { v ->
+                    if (v.isBlank()) save(hosts.filterIndexed { j, _ -> j != i }) else edit(i) { it.copy(url = v) }
+                }
+                EditableTextRow(str("network.host.ip"), entry.ip, focusId = "host$i.ip") { v ->
+                    edit(i) { it.copy(ip = v.ifEmpty { "0.0.0.0" }) }
+                }
+                ToggleRow(str("network.host.enabled"), entry.enabled, focusId = "host$i.enabled") { on -> edit(i) { it.copy(enabled = on) } }
+                HostRemoveRow(str("network.host.remove"), focusId = "host$i.remove") {
+                    save(hosts.filterIndexed { j, _ -> j != i })
+                }
+                SettingsDivider()
+            }
+            // A new entry starts from its hostname; its name and address are then set on its own rows.
+            EditableTextRow(str("network.addHost"), "", emptyText = "", focusId = "host.add") { newUrl ->
+                if (newUrl.isNotBlank())
+                    save(hosts + Dev9HostMapping(url = newUrl, ip = "0.0.0.0", enabled = true))
+            }
+            SettingsDivider()
+        }
         } // end Online-only block
         ToggleRow(str("network.logDhcp"), s.network.dev9EthLogDhcp, field = "dev9EthLogDhcp") {
             apply(s.copy(network = s.network.copy(dev9EthLogDhcp = it)))
@@ -270,417 +367,6 @@ fun NetworkTab(state: MutableState<Settings>) {
             apply(s.copy(system = s.system.copy(usbKeyboard = it)))
         }
         HelpText(str("network.usbKeyboard.help"))
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Intercept DHCP + Internal DNS, laid out like PCSX2's Qt "Intercept DHCP" / "Internal DNS" tabs.
-//
-// What actually reaches the core matters more than mirroring the desktop dialog field-for-field:
-//  * Sockets (the normal Android backend) ALWAYS runs the internal DHCP server and forces the PS2
-//    IP, subnet mask and gateway itself (sockets.cpp: InitInternalServer(..., true, ps2IP, subnet,
-//    gateway)). Showing editable IP/mask/gateway rows there presented settings that did nothing, so
-//    in Sockets mode only the DNS rows are shown and Intercept DHCP reads as always on.
-//  * PCAP/TAP honour InterceptDHCP, AutoMask/AutoGateway and the typed addresses. Typing a gateway
-//    or mask switches its Auto toggle off, for the same reason typing a DNS address used to switch
-//    that slot to Manual: left on Auto, the typed value was saved and then silently ignored.
-//  * A DNS address row is only shown while its slot is Manual, the only mode that reads it.
-// ---------------------------------------------------------------------------------------------
-
-/** Mode names exactly as Pcsx2Config's DnsModeNames spells them; they are written to the INI. */
-private val DNS_MODES = listOf("Manual", "Auto", "Internal")
-
-/** The address the core hands out as DNS in Internal mode (DHCP_Server.cpp). Shown so people can
- *  recognise it when a game's network screen displays it. */
-private const val INTERNAL_DNS_IP = "192.0.2.1"
-
-private fun isSocketsApi(api: String) = api.isEmpty() || api == "Sockets"
-
-@Composable
-private fun DhcpSection(s: Settings, save: (Settings) -> Unit) {
-    val net = s.network
-    val sockets = isSocketsApi(net.dev9EthApi)
-    val dhcpActive = sockets || net.dev9InterceptDhcp
-
-    SectionHeader(str("network.dhcp.header"))
-    if (sockets) {
-        ReadOnlyRow(
-            label = str("network.interceptDhcp"),
-            value = str("network.dhcp.alwaysOn"),
-            description = str("network.dhcp.socketsNote"),
-        )
-    } else {
-        ToggleRow(
-            str("network.interceptDhcp"),
-            net.dev9InterceptDhcp,
-            description = str("network.dhcp.interceptDesc"),
-            field = "dev9InterceptDhcp",
-        ) { save(s.copy(network = net.copy(dev9InterceptDhcp = it))) }
-    }
-    SettingsDivider()
-
-    if (!dhcpActive) {
-        HelpText(str("network.dhcp.offHelp"))
-        return
-    }
-
-    if (!sockets) {
-        IpFieldRow("network.ps2Ip", str("network.ps2Ip"), net.dev9Ps2Ip) {
-            save(s.copy(network = net.copy(dev9Ps2Ip = it)))
-        }
-        SettingsDivider()
-        ToggleRow(str("network.autoSubnetMask"), net.dev9AutoMask, field = "dev9AutoMask") {
-            save(s.copy(network = net.copy(dev9AutoMask = it)))
-        }
-        SettingsDivider()
-        IpFieldRow(
-            "network.subnetMask", str("network.subnetMask"), net.dev9Mask,
-            description = if (net.dev9AutoMask) str("network.dhcp.typingTurnsOffAuto") else null,
-        ) { save(s.copy(network = net.copy(dev9Mask = it, dev9AutoMask = if (it != "0.0.0.0") false else net.dev9AutoMask))) }
-        SettingsDivider()
-        ToggleRow(str("network.autoGateway"), net.dev9AutoGateway, field = "dev9AutoGateway") {
-            save(s.copy(network = net.copy(dev9AutoGateway = it)))
-        }
-        SettingsDivider()
-        IpFieldRow(
-            "network.gateway", str("network.gateway"), net.dev9Gateway,
-            description = if (net.dev9AutoGateway) str("network.dhcp.typingTurnsOffAuto") else null,
-        ) { save(s.copy(network = net.copy(dev9Gateway = it, dev9AutoGateway = if (it != "0.0.0.0") false else net.dev9AutoGateway))) }
-        SettingsDivider()
-    }
-
-    DnsSlot(
-        label = str("network.primaryDns"),
-        mode = net.dev9ModeDns1,
-        address = net.dev9Dns1,
-        modeField = "dev9ModeDns1",
-        addressId = "network.dns1",
-        addressLabel = str("network.dns1"),
-        onMode = { save(s.copy(network = net.copy(dev9ModeDns1 = it))) },
-        onAddress = { save(s.copy(network = net.copy(dev9Dns1 = it))) },
-    )
-    SettingsDivider()
-    DnsSlot(
-        label = str("network.secondaryDns"),
-        mode = net.dev9ModeDns2,
-        address = net.dev9Dns2,
-        modeField = "dev9ModeDns2",
-        addressId = "network.dns2",
-        addressLabel = str("network.dns2"),
-        onMode = { save(s.copy(network = net.copy(dev9ModeDns2 = it))) },
-        onAddress = { save(s.copy(network = net.copy(dev9Dns2 = it))) },
-    )
-    SettingsDivider()
-}
-
-/** One DNS slot: the Manual/Auto/Internal picker, plus the address row when (and only when) the
- *  slot is Manual, since that is the only mode the core reads the address in. */
-@Composable
-private fun DnsSlot(
-    label: String,
-    mode: String,
-    address: String,
-    modeField: String,
-    addressId: String,
-    addressLabel: String,
-    onMode: (String) -> Unit,
-    onAddress: (String) -> Unit,
-) {
-    val index = DNS_MODES.indexOf(mode).let { if (it >= 0) it else 1 }
-    SegmentedRow(
-        label = label,
-        options = listOf(str("network.dnsMode.manual"), str("network.dnsMode.auto"), str("network.dnsMode.internal")),
-        selectedIndex = index,
-        description = when (DNS_MODES[index]) {
-            "Manual" -> str("network.dnsMode.manual.desc")
-            "Internal" -> str("network.dnsMode.internal.desc").replace("{ip}", INTERNAL_DNS_IP)
-            else -> str("network.dnsMode.auto.desc")
-        },
-        field = modeField,
-        onChange = { onMode(DNS_MODES[it]) },
-    )
-    if (DNS_MODES[index] == "Manual") {
-        IpFieldRow(addressId, "   ↳ $addressLabel", address, onChange = onAddress)
-    }
-}
-
-@Composable
-private fun InternalDnsSection(s: Settings, save: (Settings) -> Unit) {
-    val net = s.network
-    val hosts = net.dev9EthHosts
-    val dhcpActive = isSocketsApi(net.dev9EthApi) || net.dev9InterceptDhcp
-    val internalInUse = dhcpActive && (net.dev9ModeDns1 == "Internal" || net.dev9ModeDns2 == "Internal")
-
-    SectionHeader(str("network.internalDns.header"))
-    HelpText(str("network.internalDns.help"))
-
-    // The entries are inert unless a DNS slot points at the internal resolver. That was the easiest
-    // mistake to make (the list and the DNS mode live in different places), so say so right here
-    // and offer the fix, rather than letting a fan server "not work" with no hint why.
-    if (hosts.any { it.enabled } && !internalInUse) {
-        HelpText(str("network.internalDns.inactiveWarning"), Modifier.padding(top = 0.dp))
-        TapRow(
-            controllerId = "network.internalDns.useInternal",
-            label = str("network.internalDns.useInternal"),
-            description = str("network.internalDns.useInternal.desc"),
-            accent = true,
-        ) {
-            save(
-                s.copy(
-                    network = net.copy(
-                        dev9ModeDns1 = "Internal",
-                        dev9ModeDns2 = "Internal",
-                        // Internal only exists behind the DHCP server; PCAP/TAP need it on.
-                        dev9InterceptDhcp = if (isSocketsApi(net.dev9EthApi)) net.dev9InterceptDhcp else true,
-                    ),
-                ),
-            )
-        }
-        SettingsDivider()
-    }
-
-    hosts.forEachIndexed { i, entry ->
-        HostEntryCard(
-            index = i,
-            entry = entry,
-            onUpdate = { updated ->
-                // Built from the list as it was when the editor opened: the keyboard reports every
-                // keystroke, and each one replaces this entry rather than appending.
-                save(s.copy(network = net.copy(dev9EthHosts = hosts.toMutableList().also { it[i] = updated })))
-            },
-            onDelete = {
-                save(s.copy(network = net.copy(dev9EthHosts = hosts.toMutableList().also { it.removeAt(i) })))
-            },
-        )
-        Spacer(Modifier.height(8.dp))
-    }
-
-    // Adding starts with the hostname, because an entry without one is meaningless (and is dropped
-    // on load). Name defaults to a label like PCSX2's "New Host" and the IP is set on the card.
-    val hostPrompt = str("network.internalDns.hostname.hint")
-    val newName = str("network.internalDns.defaultName")
-    val add = {
-        com.armsx2.ui.home.LibraryKeyboard.open(
-            "",
-            { typed ->
-                val url = cleanHostname(typed)
-                val list = if (url.isEmpty()) hosts
-                    else hosts + Dev9HostMapping(name = "$newName ${hosts.size + 1}", url = url, ip = "0.0.0.0", enabled = true)
-                save(s.copy(network = net.copy(dev9EthHosts = list)))
-            },
-            hostPrompt,
-        )
-    }
-    TapRow(
-        controllerId = "network.internalDns.add",
-        label = "+ " + str("network.internalDns.add"),
-        description = str("network.internalDns.add.desc"),
-        accent = true,
-        onTap = add,
-    )
-}
-
-/** One Internal DNS entry as a card: Name, Hostname, IP address, Enabled, Delete — the same
- *  columns as PCSX2's table, stacked because a table does not fit a phone in portrait. */
-@Composable
-private fun HostEntryCard(
-    index: Int,
-    entry: Dev9HostMapping,
-    onUpdate: (Dev9HostMapping) -> Unit,
-    onDelete: () -> Unit,
-) {
-    val id = "network.internalDns.host$index"
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(rowAura())
-            .padding(horizontal = 4.dp, vertical = 4.dp),
-    ) {
-        Text(
-            entry.name.ifBlank { "${str("network.host")} ${index + 1}" },
-            color = if (entry.enabled) Colors.pasx2_blue else MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.Bold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-        )
-        TextFieldRow(
-            controllerId = "$id.name",
-            label = str("network.internalDns.name"),
-            value = entry.name,
-            emptyText = str("network.localLink.notSet"),
-            fieldLabel = str("network.internalDns.name"),
-        ) { onUpdate(entry.copy(name = it.trim())) }
-        TextFieldRow(
-            controllerId = "$id.url",
-            label = str("network.internalDns.hostname"),
-            value = entry.url,
-            emptyText = str("network.localLink.notSet"),
-            fieldLabel = str("network.internalDns.hostname.hint"),
-        ) {
-            // An emptied hostname keeps the old one; Delete is the way to remove an entry.
-            val url = cleanHostname(it)
-            if (url.isNotEmpty()) onUpdate(entry.copy(url = url))
-        }
-        IpFieldRow("$id.ip", str("network.internalDns.ip"), entry.ip) { onUpdate(entry.copy(ip = it)) }
-        // Not the shared ToggleRow: that registers for pad navigation as "toggle:<label>", so every
-        // card's "Enabled" would share one id and only one of them would be reachable.
-        val flip = {
-            com.armsx2.MenuSfx.play(if (!entry.enabled) com.armsx2.MenuSfx.Event.TOGGLE_ON else com.armsx2.MenuSfx.Event.TOGGLE_OFF)
-            onUpdate(entry.copy(enabled = !entry.enabled))
-        }
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
-                .clickable(onClick = flip)
-                .controllerFocusable("$id.enabled", onConfirm = flip)
-                .padding(horizontal = 6.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(str("network.internalDns.enabled"), color = MaterialTheme.colorScheme.onSurface, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.weight(1f))
-            androidx.compose.material3.Switch(checked = entry.enabled, onCheckedChange = { flip() })
-        }
-        TapRow(
-            controllerId = "$id.delete",
-            label = str("network.internalDns.delete"),
-            description = null,
-            danger = true,
-            onTap = onDelete,
-        )
-    }
-}
-
-/** Normalises what people paste or type into a hostname: the core lowercases the game's query but
- *  compares it against the stored entry as-is (DNS_Server::CheckHostList), so a capital letter —
- *  which phone keyboards add on their own — meant the entry could never match. Also drops a
- *  scheme, path, port and stray whitespace, since a guide's "http://patch.example.com/" is a common
- *  thing to copy. */
-internal fun cleanHostname(raw: String): String {
-    var h = raw.trim().lowercase()
-    h = h.substringAfter("://")
-    h = h.substringBefore('/').substringBefore('?').substringBefore('#')
-    h = h.substringBefore(':') // port
-    return h.filter { !it.isWhitespace() }.trimEnd('.')
-}
-
-/** Returns [raw] as a canonical dotted IPv4 ("054.1.2.3" → "54.1.2.3"), or null while it is not one
- *  yet. The keyboard reports every keystroke, so a half-typed address must not be stored. */
-internal fun parseIpv4(raw: String): String? {
-    val parts = raw.trim().split('.')
-    if (parts.size != 4) return null
-    val nums = parts.map { p ->
-        if (p.isEmpty() || p.length > 3 || !p.all { it.isDigit() }) return null
-        p.toInt().takeIf { it in 0..255 } ?: return null
-    }
-    return nums.joinToString(".")
-}
-
-@Composable
-private fun SectionHeader(text: String) {
-    Text(
-        text,
-        color = Colors.pasx2_blue,
-        fontWeight = FontWeight.Bold,
-        fontSize = 14.sp,
-        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp),
-    )
-}
-
-/** An IPv4 field. Saves only once the text is a complete address; until then the keyboard simply
- *  keeps what is being typed and the stored value is left alone. */
-@Composable
-private fun IpFieldRow(
-    controllerId: String,
-    label: String,
-    value: String,
-    description: String? = null,
-    onChange: (String) -> Unit,
-) {
-    TextFieldRow(
-        controllerId = controllerId,
-        label = label,
-        value = value.ifEmpty { "0.0.0.0" },
-        emptyText = "0.0.0.0",
-        fieldLabel = str("network.ipHint"),
-        description = description,
-    ) { typed -> parseIpv4(typed)?.let(onChange) }
-}
-
-/** Label + value row that edits through LibraryKeyboard (pad-navigable, unlike a dialog) and
- *  registers with the controller registry so it is reachable on a gamepad. */
-@Composable
-private fun TextFieldRow(
-    controllerId: String,
-    label: String,
-    value: String,
-    emptyText: String,
-    fieldLabel: String,
-    description: String? = null,
-    onChange: (String) -> Unit,
-) {
-    val edit = { com.armsx2.ui.home.LibraryKeyboard.open(value, onChange, fieldLabel) }
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .clickable(onClick = edit)
-            .controllerFocusable(controllerId, onConfirm = edit)
-            .padding(horizontal = 6.dp, vertical = 10.dp),
-    ) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.weight(1f))
-            Text(
-                value.ifEmpty { emptyText },
-                color = Color(0xFFCCCCCC),
-                fontSize = 14.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(start = 12.dp),
-            )
-        }
-        if (description != null) {
-            Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
-        }
-    }
-}
-
-/** A tappable action row (Add host, Delete, the "use Internal DNS" fix). */
-@Composable
-private fun TapRow(
-    controllerId: String,
-    label: String,
-    description: String?,
-    accent: Boolean = false,
-    danger: Boolean = false,
-    onTap: () -> Unit,
-) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(rowAura())
-            .clickable(onClick = onTap)
-            .controllerFocusable(controllerId, onConfirm = onTap)
-            .padding(horizontal = 6.dp, vertical = 12.dp),
-    ) {
-        Text(
-            label,
-            color = when {
-                danger -> Color(0xFFFF6B6B)
-                accent -> Colors.pasx2_blue
-                else -> MaterialTheme.colorScheme.onSurface
-            },
-            fontSize = 16.sp,
-            fontWeight = FontWeight.SemiBold,
-        )
-        if (description != null) {
-            Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
-        }
     }
 }
 
@@ -817,9 +503,11 @@ private fun ReadOnlyRow(label: String, value: String, description: String) {
 }
 
 /**
- * A Local Link field: like [TextFieldRow], but it always shows a description under the label and
- * can carry a Generate action. The address rows use [IpFieldRow], which only saves a complete IPv4
- * address — right for DNS and gateways, wrong for a room code, a port or a peer id.
+ * A Local Link field: same look as [EditableTextRow], but it shows a description under the label
+ * and does not assume the value is an IP address. [EditableTextRow] prefills AND displays
+ * "0.0.0.0" for an empty value and hardcodes the edit dialog's field label to "Address" — correct
+ * for the DNS/gateway rows it serves, wrong for a room code, a port or a peer id. Kept separate
+ * rather than adding switches to that one, which has a dozen existing call sites.
  *
  * onChange receives the trimmed text; callers do their own validation/coercion.
  */
@@ -886,6 +574,69 @@ private fun LocalLinkRow(
     }
 }
 
+/** [emptyText] is shown when [value] is empty; the address rows show 0.0.0.0, the host entries' name
+ *  and hostname rows something else. [focusId] must be unique on the screen: the host entries repeat
+ *  their labels, so they pass their own. */
+@Composable
+private fun EditableTextRow(
+    label: String,
+    value: String,
+    emptyText: String = "0.0.0.0",
+    focusId: String = label,
+    onChange: (String) -> Unit,
+) {
+    // No modal at all. Text entry goes through LibraryKeyboard, exactly like LocalLinkRow above
+    // — and these rows needed the change twice over: the dialog swallowed the pad, AND the row
+    // carried no registry registration, so it could not be reached to open it in the first place.
+    val fieldLabel = if (emptyText == "0.0.0.0") str("network.address") else label
+    val edit = {
+        com.armsx2.ui.home.LibraryKeyboard.open(
+            value.ifEmpty { if (emptyText == "0.0.0.0") "0.0.0.0" else "" },
+            { onChange(it.trim()) },
+            fieldLabel,
+        )
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(64.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(rowAura())
+            .clickable(onClick = edit)
+            .controllerFocusable("network.field:$focusId", onConfirm = edit)
+            .padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.weight(1f))
+        Text(
+            value.ifEmpty { emptyText },
+            color = Color(0xFFCCCCCC),
+            fontSize = 14.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** Removes a DNS host entry. Same shape as the rows around it, in the error colour. */
+@Composable
+private fun HostRemoveRow(label: String, focusId: String, onRemove: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(rowAura())
+            .clickable(onClick = onRemove)
+            .controllerFocusable("network.field:$focusId", onConfirm = onRemove)
+            .padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, color = MaterialTheme.colorScheme.error, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
 @Composable
 private fun DeviceChooser(
     selected: String,
@@ -930,7 +681,7 @@ private fun DeviceChooser(
 
 @Composable
 private fun HddFileRow(fileName: String, onChange: (String) -> Unit, onReset: () -> Unit) {
-    // Same treatment as TextFieldRow: the keyboard, not a dialog. D-pad Left resets, matching
+    // Same treatment as EditableTextRow: the keyboard, not a dialog. D-pad Left resets, matching
     // how every other row in this app uses left/right on the focused control.
     val fieldLabel = str("network.hddImage.fieldLabel")
     val edit = {
