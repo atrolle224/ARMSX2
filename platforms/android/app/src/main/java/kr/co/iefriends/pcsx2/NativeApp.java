@@ -191,6 +191,11 @@ public class NativeApp {
 	 *  Save Log export. Used by the Joy-Con input diagnostic; no-ops if the console isn't open. */
 	public static native void emulog(String msg);
 
+	/** True while the core has logs/emulog.txt open for writing. It opens the file when the app
+	 *  starts and again at the boot of each game after the first, and closes it when a game ends.
+	 *  A caller that wants to move the file must wait until this is false. */
+	public static native boolean isEmulogOpen();
+
 	/**
 	 * Live GS-only reconfigure for a running VM. Reloads the whole EmuCore/GS
 	 * section from the base settings layer and pushes it to the GS thread via
@@ -323,6 +328,17 @@ public class NativeApp {
 
 	/** Why the last runVMThread could not boot, or "" when it did. */
 	public static native String getLastBootError();
+
+	/** The core's VMBootResult for the last runVMThread that could not boot, BOOT_RESULT_SUCCESS when it did. */
+	public static native int getLastBootResult();
+
+	// VMBootResult values (pcsx2/VMManager.h); native-lib.cpp asserts they match.
+	public static final int BOOT_RESULT_SUCCESS = 0;
+	public static final int BOOT_RESULT_FAILURE = 1;
+	/** No BIOS is set up, or the one that was is gone, and the BIOS folder has no other. */
+	public static final int BOOT_RESULT_BIOS_NOT_FOUND = 3;
+	/** The BIOS file is there but could not be read, or is not a PS2 BIOS. */
+	public static final int BOOT_RESULT_BIOS_NOT_USABLE = 4;
 
 	/** The cabinet controls (ARCADE_MODE_*) the core gives a game ID such as NM00004. */
 	public static native int arcadeModeForGameId(String gameId);
@@ -560,6 +576,21 @@ public class NativeApp {
 			com.armsx2.config.AutoTuneStore.INSTANCE.onCommitted(serial, section, key, value);
 		} catch (Throwable t) {
 			android.util.Log.e("ARMSX2", "onAutoTuneCommitted failed: " + section + "/" + key, t);
+		}
+	}
+	/** The output surface as auto-tune has to see it, pushed from EmulationSurface.applyOutputScale:
+	 *  [hwScaler] is the "Display Resolution (HW scaler)" in effect, an auto-tune trial included (0 = Screen,
+	 *  N = the short side is held to 448 * N), and [baseShortSide] the surface's short side in pixels before
+	 *  the setting shrinks it. */
+	public static native void setOutputScaleState(int hwScaler, int baseShortSide);
+	/** Called from native (the CPU thread) when auto-tune tries a display scale: [value] >= 0 is put in
+	 *  effect in place of the saved setting, -1 hands the surface back to it (AutoTuneStore.onDisplayScale).
+	 *  Nothing may escape: native makes no exception check beyond clearing one. */
+	public static void onAutoTuneDisplayScale(int value) {
+		try {
+			com.armsx2.config.AutoTuneStore.INSTANCE.onDisplayScale(value);
+		} catch (Throwable t) {
+			android.util.Log.e("ARMSX2", "onAutoTuneDisplayScale failed: " + value, t);
 		}
 	}
 	/** What the game database sets for a serial: one line per setting a per-game key can claim,
@@ -1038,6 +1069,11 @@ public class NativeApp {
 	/** Top-align the render in a LANDSCAPE window (foldables / clamshell controllers). */
 	public static native void setLandscapeRenderTop(boolean top);
 
+	/** Side-by-side VR for phone headsets: the game drawn once in each half of the screen.
+	 *  [sizePercent] 30..100 of each half, [distancePercent] and [heightPercent] -100..100 of the
+	 *  room left around the pictures. Applies live. */
+	public static native void setSideBySideVR(boolean enabled, int sizePercent, int distancePercent, int heightPercent);
+
 	/** Pixels to keep clear at the top of a PORTRAIT render for a punch-hole/notch camera. Taken
 	 *  from the window's display cutout; 0 on devices without one. Only affects portrait
 	 *  top-aligned output. */
@@ -1065,6 +1101,10 @@ public class NativeApp {
 	 *  instead of OpenGL. The decision needs the driver-bug database (keyed on a parsed driver
 	 *  revision), which lives natively, so the app supplies the strings rather than the verdict. */
 	public static native void setAutoRendererGpuStrings(String vendor, String renderer, String version);
+	/** The first instruction set extension this build was compiled for that the CPU lacks
+	 *  ("the dot product instructions", ...), or null if it has them all. Callable before the core
+	 *  is initialized; the app must not start the core when it is non-null. */
+	public static native String missingCpuFeature();
 	/** Whether the driver list offers malisx2 for this device's GPU (CustomDriver.offersMaliSX2).
 	 *  Pushed once at startup. The core pairs it with the driver the open Vulkan device is on and
 	 *  posts the "get malisx2" OSD notice at game start when that driver is not malisx2. */
@@ -1160,6 +1200,8 @@ public class NativeApp {
 	 * Returns null if the file isn't a valid BIOS image.
 	 */
 	public static native BiosInfo getBiosInfoFromFd(int fd);
+	/** Whether the file is a PS1 BIOS. Takes ownership of fd, like getBiosInfoFromFd. */
+	public static native boolean isPs1BiosFromFd(int fd);
 
 	/**
 	 * Read enough of a PS2 disc image to extract its serial (e.g.

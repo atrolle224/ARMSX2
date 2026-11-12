@@ -591,6 +591,8 @@ endif()
 set(pcsx2GSSources
 	GS/GS.cpp
 	GS/GSCacheFile.cpp
+	GS/GSBlockId.cpp
+	GS/GSCompileQueue.cpp
 	GS/GSClut.cpp
 	GS/GSDrawingContext.cpp
 	GS/GSDrawingEnvironment.cpp
@@ -633,10 +635,12 @@ set(pcsx2GSSources
 	GS/Renderers/Common/GSVertexTrace.cpp
 	GS/Renderers/Null/GSDeviceNone.cpp
 	GS/Renderers/Null/GSRendererNull.cpp
+	GS/Renderers/HW/GSBurstMemo.cpp
 	GS/Renderers/HW/GSDrawLog.cpp
 	GS/Renderers/HW/GSHwHack.cpp
 	GS/Renderers/HW/GSLineRuns.cpp
 	GS/Renderers/HW/GSRendererHW.cpp
+	GS/Renderers/HW/GSRendererHWBurstMemo.cpp
 	GS/Renderers/HW/GSTextureCache.cpp
 	GS/Renderers/HW/GSTextureReplacementLoaders.cpp
 	GS/Renderers/HW/GSTextureReplacements.cpp
@@ -663,6 +667,7 @@ set(pcsx2GSHeaders
 	GS/GSBackQueue.h
 	GS/GSCacheFile.h
 	GS/GSClut.h
+	GS/GSCompileQueue.h
 	GS/GSCompileStats.h
 	GS/GSDrawingContext.h
 	GS/GSDrawingEnvironment.h
@@ -685,10 +690,12 @@ set(pcsx2GSHeaders
 	GS/GSTables.h
 	GS/GSUtil.h
 	GS/GSVector.h
+	GS/GSBlockId.h
 	GS/GSXXH.h
 	GS/MultiISA.h
 	GS/Renderers/Common/GSBlendCarry.h
 	GS/Renderers/Common/GSBlendConstantPolicy.h
+	GS/Renderers/Common/GSRunsPolicy.h
 	GS/Renderers/Common/GSBackThreadPolicy.h
 	GS/Renderers/Common/GSCopyRoadBlendingPolicy.h
 	GS/Renderers/Common/GSDynamicFeedbackLoopPolicy.h
@@ -700,6 +707,7 @@ set(pcsx2GSHeaders
 	GS/Renderers/Common/GSAlphaBitLogicOp.h
 	GS/Renderers/Common/GSReplacementAlphaSnap.h
 	GS/Renderers/Common/GSFastStencilShadow.h
+	GS/Renderers/Common/GSStencilCounter.h
 	GS/Renderers/Common/GSFieldShiftDetector.h
 	GS/Renderers/Common/GSFieldShiftPolicy.h
 	GS/Renderers/Common/GSFramebufferFetchPolicy.h
@@ -731,6 +739,8 @@ set(pcsx2GSHeaders
 	GS/Renderers/HW/GSDrawLog.h
 	GS/Renderers/HW/GSHwHack.h
 	GS/Renderers/HW/GSLineRuns.h
+	GS/Renderers/HW/GSBurstMemo.h
+	GS/Renderers/HW/GSDepthFormatMove.h
 	GS/Renderers/HW/GSLineWalk.h
 	GS/Renderers/HW/GSPointPlace.h
 	GS/Renderers/HW/GSRendererHW.h
@@ -751,12 +761,15 @@ set(pcsx2GSHeaders
 	GS/Renderers/SW/GSDrawScanline.h
 	GS/Renderers/SW/GSNewCodeGenerator.h
 	GS/Renderers/SW/GSPerspectivePlane.h
+	GS/Renderers/SW/GSStqExtremes.h
 	GS/Renderers/SW/GSRasterizer.h
 	GS/Renderers/SW/GSRendererSW.h
 	GS/Renderers/SW/GSScanlineEnvironment.h
 	GS/Renderers/SW/GSVertexQDivide.h
 	GS/Renderers/SW/GSSetupPrimCodeGenerator.all.h
 	GS/Renderers/SW/GSSwTextureDirty.h
+	GS/Renderers/SW/GSSwTargetAlias.h
+	GS/Renderers/SW/GSSwTextureReaders.h
 	GS/Renderers/SW/GSTextureCacheSW.h
 	GS/Renderers/SW/GSVertexSW.h
 	)
@@ -786,6 +799,7 @@ if(USE_OPENGL)
 		GS/Renderers/OpenGL/GSTextureOGL.cpp
 	)
 	list(APPEND pcsx2GSHeaders
+		GS/Renderers/OpenGL/GLADFunctions.inl
 		GS/Renderers/OpenGL/GLContext.h
 		GS/Renderers/OpenGL/GLProgram.h
 		GS/Renderers/OpenGL/GLShaderCache.h
@@ -837,6 +851,7 @@ if(USE_VULKAN)
 	list(APPEND pcsx2GSSources
 		GS/Renderers/Vulkan/GSDeviceVK.cpp
 		GS/Renderers/Vulkan/GSLsfg.cpp
+		GS/Renderers/Vulkan/GSRunsVK.cpp
 		GS/Renderers/Vulkan/GSTextureVK.cpp
 		GS/Renderers/Vulkan/vk_mem_alloc.cpp
 		GS/Renderers/Vulkan/VKBuilders.cpp
@@ -908,6 +923,7 @@ if(USE_VULKAN)
 	list(APPEND pcsx2GSHeaders
 		GS/Renderers/Vulkan/GSDeviceVK.h
 		GS/Renderers/Vulkan/GSLsfg.h
+		GS/Renderers/Vulkan/GSRunsVK.h
 		GS/Renderers/Vulkan/GSTextureVK.h
 		GS/Renderers/Vulkan/VKLibretro.h
 		GS/Renderers/Vulkan/VKBuilders.h
@@ -1424,12 +1440,15 @@ set(pcsx2x86Headers
 # ARM64
 set(pcsx2arm64Sources
 	arm64/AsmHelpers.cpp
+	arm64/BlockLut-arm64.cpp
 	arm64/FPU-divunit-arm64.cpp
 	arm64/iCore-arm64.cpp
 	arm64/iR3000A-arm64.cpp
 	arm64/iR3000Atables-arm64.cpp
 	arm64/iR5900-arm64.cpp
 	arm64/iR5900Templates-arm64.cpp
+	arm64/RecCrashReport-arm64.cpp
+	arm64/RecErrorReport-arm64.cpp
 	x86/BaseblockEx.cpp  # arch-neutral baseblock manager, shared with the x86 build
 	arm64/iR5900Arit-arm64.cpp
 	arm64/iR5900AritImm-arm64.cpp
@@ -1450,6 +1469,7 @@ set(pcsx2arm64Sources
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
 	arm64/microVU-arm64.cpp
+	arm64/microVU_JumpTable-arm64.cpp
 	arm64/vuaot/VuAotBackground.cpp
 	arm64/vuaot/VuAotDecode.cpp
 	arm64/vuaot/VuAotGraph.cpp
@@ -1465,9 +1485,12 @@ set(pcsx2arm64Sources
 
 set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
+	arm64/BlockLut-arm64.h
 	arm64/FPU-divunit-arm64.h
 	arm64/iCore-arm64.h
 	arm64/iR3000A-arm64.h
+	arm64/RecCrashReport-arm64.h
+	arm64/RecErrorReport-arm64.h
 	arm64/iR5900-arm64.h
 	arm64/iR5900Analysis.h
 	arm64/microVU-arm64.h
@@ -1478,6 +1501,7 @@ set(pcsx2arm64Headers
 	arm64/vuaot/microVU_VuAot-arm64.inl
 	arm64/microVU_Misc-arm64.h
 	arm64/VuFmacFlags-arm64.h
+	arm64/microVU_JumpTable-arm64.h
 	arm64/vuaot/VuAotBackground.h
 	arm64/vuaot/VuAotDecode.h
 	arm64/vuaot/VuAotPersist.h
@@ -1786,8 +1810,26 @@ add_custom_command(
 	COMMENT "Hashing the GS sources for the shader cache identity"
 	VERBATIM)
 target_sources(PCSX2 PRIVATE "${ARMSX2_GS_CACHE_ID_DIR}/gs_cache_build_id.h")
+# What a recorded Vulkan pipeline key's bits mean (cmake/GSKeyLayoutId.cmake): the key lists are named by
+# it, not by the build identity, so they survive the builds that leave the selectors alone.
+set(ARMSX2_GS_KEY_LAYOUT_INPUTS
+	"${ARMSX2_REPO_ROOT}/pcsx2/GS/Renderers/Common/GSDevice.h"
+	"${ARMSX2_REPO_ROOT}/pcsx2/GS/Renderers/Common/GSShaderEnums.h"
+	"${ARMSX2_REPO_ROOT}/pcsx2/GS/Renderers/Common/GSAlphaBitLogicOp.h"
+	"${ARMSX2_REPO_ROOT}/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h")
+string(JOIN "|" ARMSX2_GS_KEY_LAYOUT_ARG ${ARMSX2_GS_KEY_LAYOUT_INPUTS})
+add_custom_command(
+	OUTPUT "${ARMSX2_GS_CACHE_ID_DIR}/gs_key_layout_id.h"
+	COMMAND ${CMAKE_COMMAND}
+		-DOUT=${ARMSX2_GS_CACHE_ID_DIR}/gs_key_layout_id.h
+		"-DFILES=${ARMSX2_GS_KEY_LAYOUT_ARG}"
+		-P "${ARMSX2_REPO_ROOT}/cmake/GSKeyLayoutId.cmake"
+	DEPENDS ${ARMSX2_GS_KEY_LAYOUT_INPUTS} "${ARMSX2_REPO_ROOT}/cmake/GSKeyLayoutId.cmake"
+	COMMENT "Hashing the TFX pipeline key layout"
+	VERBATIM)
+target_sources(PCSX2 PRIVATE "${ARMSX2_GS_CACHE_ID_DIR}/gs_key_layout_id.h")
 set_source_files_properties(GS/GSCacheFile.cpp PROPERTIES
-	OBJECT_DEPENDS "${ARMSX2_GS_CACHE_ID_DIR}/gs_cache_build_id.h"
+	OBJECT_DEPENDS "${ARMSX2_GS_CACHE_ID_DIR}/gs_cache_build_id.h;${ARMSX2_GS_CACHE_ID_DIR}/gs_key_layout_id.h"
 	INCLUDE_DIRECTORIES "${ARMSX2_GS_CACHE_ID_DIR}")
 
 # common Sources

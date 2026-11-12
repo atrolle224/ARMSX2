@@ -10,6 +10,8 @@ add_pcsx2_test(gs_vertex_tests
 	${CMAKE_CURRENT_SOURCE_DIR}/../StubHost.cpp
 	gs_vertex_tests.cpp
 	gs_kick_kernel_tests.cpp
+	gs_kick_decide_tests.cpp
+	gs_kick_convert_tests.cpp
 	gs_backqueue_tests.cpp
 	gs_back_thread_policy_tests.cpp
 	gs_interlace_policy_tests.cpp
@@ -29,6 +31,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_gpu_driver_profile_tests.cpp
 	gs_driver_report_tests.cpp
 	gs_vulkan_device_rules_tests.cpp
+	gs_vk_cached_dynamic_state_tests.cpp
 	gs_gpu_profile_tests.cpp
 	gs_draw_staging_tests.cpp
 	gs_draw_env_snapshot_tests.cpp
@@ -52,6 +55,7 @@ add_pcsx2_test(gs_vertex_tests
 	gs_sw_scanline_tclag_tests.cpp
 	gs_sw_stq_blit_tests.cpp
 	gs_sw_coordinate_field_tests.cpp
+	gs_sw_stq_extremes_tests.cpp
 	gs_sw_coordinate_grain_tests.cpp
 	gs_sw_sprite_ramp_tests.cpp
 	gs_sw_perspective_plane_tests.cpp
@@ -64,31 +68,40 @@ add_pcsx2_test(gs_vertex_tests
 	gs_local_memory_move_tests.cpp
 	gs_local_memory_write_stamp_tests.cpp
 	gs_local_memory_write_source_bounds_tests.cpp
+	gs_readback_block_write_tests.cpp
 	gs_local_memory_four_bit_stream_tests.cpp
 	gs_write_stamp_writer_tests.cpp
 	gs_hash_memo_tests.cpp
 	gs_hash_raw_key_tests.cpp
 	gs_clut_tests.cpp
+	gs_burst_memo_tests.cpp
+	gs_burst_memo_draw_tests.cpp
 	gs_alpha_known_bits_tests.cpp
 	gs_depth_coverage_tests.cpp
 	gs_draw_alpha_mask_tests.cpp
 	gs_fast_stencil_shadow_tests.cpp
+	gs_stencil_counter_tests.cpp
 	gs_sprite_cover_tests.cpp
 	gs_sprite_edge_snap_tests.cpp
 	gs_sprite_pass_order_tests.cpp
 	gs_pass_scheduler_tests.cpp
 	gs_null_device_profile_tests.cpp
+	gs_sw_target_alias_tests.cpp
 	gs_sw_texture_dirty_tests.cpp
+	gs_sw_texture_readers_tests.cpp
 	gs_blend_constant_policy_tests.cpp
+	gs_runs_policy_tests.cpp
 	gs_blend_carry_tests.cpp
 	gs_over_one_two_pass_tests.cpp
 	gs_autoflush_engine_level_tests.cpp
+	gs_kick_publish_tests.cpp
 	gs_draw_buffer_overlap_tests.cpp
 	gs_ktx_tests.cpp
 	gs_texture_cache_grid_tests.cpp
 	gs_texture_cache_move_tests.cpp
+	gs_read_stash_tests.cpp
+	gs_depth_format_move_tests.cpp
 	gs_target_update_tests.cpp
-	gs_exact_dirty_mapping_tests.cpp
 	gs_target_rebase_tests.cpp
 	gs_target_rebase_integration_tests.cpp
 	gs_dither_scale_tests.cpp
@@ -99,12 +112,17 @@ add_pcsx2_test(gs_vertex_tests
 	gs_field_shift_detector_tests.cpp
 	gs_channel_shuffle_cover_tests.cpp
 	gs_sw_palette_block_copy_tests.cpp
-	gs_tc_union_cover_tests.cpp
+	gs_target_dirty_tests.cpp
+	gs_lean_target_tests.cpp
 	gs_cache_file_tests.cpp
+	gs_compile_queue_tests.cpp
+	gs_vk_cache_stamp_tests.cpp
 	gs_hash_cache_inject_tests.cpp
 	gs_hash_cache_limits_tests.cpp
 	gs_xxh_block_hasher_tests.cpp
 	gs_texture_replacement_worker_tests.cpp
+	gs_texture_name_pin_tests.cpp
+	gs_block_id_tests.cpp
 )
 
 target_include_directories(gs_vertex_tests PRIVATE

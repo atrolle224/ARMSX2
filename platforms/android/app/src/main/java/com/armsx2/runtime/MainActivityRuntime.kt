@@ -30,6 +30,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Text
 import androidx.compose.runtime.mutableStateOf
@@ -53,6 +54,7 @@ import com.armsx2.BuildConfig
 import com.armsx2.EmuState
 import com.armsx2.FilenameParser
 import com.armsx2.GameInfo
+import com.armsx2.LegacyGpuCache
 import com.armsx2.MemoryCardBackup
 import com.armsx2.PlayTime
 import com.armsx2.i18n.str
@@ -692,24 +694,28 @@ open class MainActivityRuntime : ComponentActivity() {
         private const val PAD_CODE_TRIANGLE = 100
         private const val PAD_CODE_CROSS = 96
 
-        /** How long to keep the combo held. Titles probe it at very different points — some well
-         *  after the PS2 logo — so this deliberately spans the whole boot sequence. */
-        private const val AUTO_PROGRESSIVE_HOLD_MS = 30_000L
-        /// How often the synthetic Triangle+Cross hold is re-pressed. Must be well under a frame
-        /// budget's worth of pad polling so the game never samples a gap, and short enough that a
-        /// pad re-init can't swallow the whole hold.
+        /** Hard ceiling on the hold, from the first press: a full BIOS intro before the ELF plus the
+         *  post-ELF window below. Titles probe the combo at very different points, so this
+         *  deliberately spans the whole boot sequence. */
+        private const val AUTO_PROGRESSIVE_HOLD_MS = 60_000L
         // Achievement-progress capture cadence. The first wait lets RetroAchievements resolve the
         // set over the network after boot; the poll only exists so a process killed mid-session
         // still leaves a recent figure in the library. Neither is latency-sensitive.
         private const val ACHIEVEMENT_SNAPSHOT_FIRST_MS = 15_000L
         private const val ACHIEVEMENT_SNAPSHOT_POLL_MS = 120_000L
 
+        /// How often the synthetic Triangle+Cross hold is re-pressed. Must be well under a frame
+        /// budget's worth of pad polling so the game never samples a gap, and short enough that a
+        /// pad re-init can't swallow the whole hold.
         private const val AUTO_PROGRESSIVE_REASSERT_MS = 200L
-        /// Keep holding this long after the game's ELF starts, then let go — the 480p prompt is
-        /// checked at game start, and holding into the menus would fight the player. 8 s (up from 4)
-        /// gives margin for titles that probe a few seconds into the ELF, once past the intro logos;
-        /// a continuously-held button presents no fresh press edge, so it won't drive early menus.
-        private const val AUTO_PROGRESSIVE_POST_ELF_MS = 8_000L
+        /// Re-press only until the ELF has run this long, which covers the pad setup at boot. After
+        /// that the hold rests on the pad state alone, so a button the player presses and lets go
+        /// stays released instead of being pressed again under them.
+        private const val AUTO_PROGRESSIVE_REASSERT_POST_ELF_MS = 3_000L
+        /// Keep holding this long after the game's ELF starts, then let go. Criterion titles such as
+        /// Burnout 3 look for the combo well into their intro, after the publisher logos. A held
+        /// button presents no fresh press edge, so it does not drive the menus in the meantime.
+        private const val AUTO_PROGRESSIVE_POST_ELF_MS = 30_000L
 
         /** Pad writes are dropped while no VM exists (applyPadButton bails on !HasValidVM), so
          *  wait for boot rather than pressing into the void. Bounded so a failed boot can't spin. */
@@ -734,23 +740,24 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (!NativeApp.hasActiveVM())
                         return@launch
                     held = true
-                    // Re-assert on a short interval rather than pressing once. The state itself
-                    // persists (Pad::SetControllerState), so a single press would mostly work — but
-                    // re-pressing cheaply survives the pad (re)init during boot ("Pad: DS2 Config
+                    // Re-assert on a short interval through boot rather than pressing once. The state
+                    // itself persists (Pad::SetControllerState), so a single press would mostly work,
+                    // but re-pressing cheaply survives the pad (re)init during boot ("Pad: DS2 Config
                     // Finished" lands after the VM goes active) with no gap for the game to sample.
                     //
-                    // Release shortly after the game's own ELF starts rather than blocking for the
-                    // full timeout: the 480p prompt is checked at game start, and continuing to jam
-                    // Triangle+Cross into a booted game would fight the player in the menus. CRC
-                    // goes non-zero exactly when the ELF is running, so it is the right edge to
-                    // watch. AUTO_PROGRESSIVE_HOLD_MS remains the hard ceiling.
+                    // Let go once the game's own ELF has run for AUTO_PROGRESSIVE_POST_ELF_MS: holding
+                    // Triangle+Cross any longer would fight the player in the menus. CRC goes non-zero
+                    // exactly when the ELF is running, so it is the right edge to watch.
+                    // AUTO_PROGRESSIVE_HOLD_MS remains the hard ceiling.
                     var elapsed = 0L
                     var sinceElf = -1L
                     while (elapsed < AUTO_PROGRESSIVE_HOLD_MS) {
                         if (!NativeApp.hasActiveVM())
                             return@launch
-                        NativeApp.setPadButton(PAD_CODE_TRIANGLE, 0, true)
-                        NativeApp.setPadButton(PAD_CODE_CROSS, 0, true)
+                        if (sinceElf < AUTO_PROGRESSIVE_REASSERT_POST_ELF_MS) {
+                            NativeApp.setPadButton(PAD_CODE_TRIANGLE, 0, true)
+                            NativeApp.setPadButton(PAD_CODE_CROSS, 0, true)
+                        }
                         delay(AUTO_PROGRESSIVE_REASSERT_MS)
                         elapsed += AUTO_PROGRESSIVE_REASSERT_MS
                         val elfRunning = runCatching { NativeApp.getGameCRC() }.getOrNull()
@@ -879,7 +886,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     else
                         NativeApp.runVMThread(m_szGamefile)
                     vmReturned = true
-                    if (!arcadeLaunch) noteBootFailure("bugreport.boot.message")
+                    if (!arcadeLaunch) noteBootFailure("bugreport.boot.message", biosAdvice = true)
                 } finally {
                     if (vmReturned) runCatching { com.armsx2.bugreport.BugReport.clearCrashMarker() }
                     // runVMThread blocks until the VM exits (Stopping/Shutdown
@@ -982,19 +989,31 @@ open class MainActivityRuntime : ComponentActivity() {
                 com.armsx2.arcade.ArcadeControls.apply(null)
             }
             // Shown with a "Report a problem" button, like any other game that fails to start.
-            noteBootFailure("arcade.error.boot")
+            noteBootFailure("arcade.error.boot", biosAdvice = false)
         }
 
         /**
          * After a VM thread returns: if the core says the game could not boot, show why and offer a
          * problem report. [messageKey] is the string that wraps the core's description. The marker
          * was never going to say anything about this, since nothing crashed.
+         *
+         * With [biosAdvice], a boot the core refused for want of a usable BIOS gets this app's own
+         * advice: the core's text for a missing BIOS describes the desktop app's folders and menus.
+         * Arcade launches go without it, since Arcade.prepare checks their BIOS before booting and
+         * the core's arcade text already says what to do.
          */
-        private fun noteBootFailure(messageKey: String) {
+        private fun noteBootFailure(messageKey: String, biosAdvice: Boolean) {
             val error = runCatching { NativeApp.getLastBootError() }.getOrNull().orEmpty()
             if (error.isBlank()) return
+            val result = runCatching { NativeApp.getLastBootResult() }.getOrDefault(NativeApp.BOOT_RESULT_FAILURE)
             runCatching {
-                com.armsx2.bugreport.BugReport.noteBootFailure(com.armsx2.i18n.I18n.get(messageKey).format(error))
+                val i18n = com.armsx2.i18n.I18n
+                val text = when {
+                    biosAdvice && result == NativeApp.BOOT_RESULT_BIOS_NOT_FOUND -> i18n.get("bugreport.boot.biosMissing")
+                    biosAdvice && result == NativeApp.BOOT_RESULT_BIOS_NOT_USABLE -> i18n.get("bugreport.boot.biosBad").format(error)
+                    else -> i18n.get(messageKey).format(error)
+                }
+                com.armsx2.bugreport.BugReport.noteBootFailure(text)
             }
         }
 
@@ -1362,7 +1381,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     armBugReportMarker(identifyDisc = false)
                     NativeApp.runVMThread(m_szGamefile)
                     vmReturned = true
-                    noteBootFailure("bugreport.boot.message")
+                    noteBootFailure("bugreport.boot.message", biosAdvice = true)
                 } finally {
                     if (vmReturned) runCatching { com.armsx2.bugreport.BugReport.clearCrashMarker() }
                     eState.value = EmuState.STOPPED
@@ -2135,7 +2154,7 @@ open class MainActivityRuntime : ComponentActivity() {
         /**
          * Puts the APK's resources in the data folder for the core (shaders, the GameDB, fonts,
          * fullscreenui, patches.zip, the controller DB, at <data folder>/resources), and on a new install
-         * of the app drops the regenerable GPU caches. Off the main thread, before the core starts.
+         * of the app drops the GPU cache files older builds left (LegacyGpuCache). Off the main thread, before the core starts.
          *
          * The files kept in step with the APK are rewritten only when this install has not written them
          * yet: the marker beside them names the install that did, and is written after a clean pass, so a
@@ -2154,24 +2173,24 @@ open class MainActivityRuntime : ComponentActivity() {
             if (MainActivity.refreshShippedAssets && MainActivity.copyFailures == 0)
                 runCatching { shipped.writeText(install) }
 
-            // On any new install of the app, drop the regenerable GPU caches. The native caches carry
-            // their own build and driver stamps and discard themselves on a mismatch; this is the second
-            // line, for anything an older build wrote before those stamps existed. The marker lives in
-            // the data root beside the caches, not in this package's preferences: a data root shared by
-            // two installs is wiped whenever the other one last used it, and a data root that moved is
-            // wiped where it now is. The marker is written only after the wipe succeeded, so a failed
-            // wipe is retried on the next launch.
+            // On any new install of the app, drop what GPU caches from before the stamped format left
+            // (LegacyGpuCache). The current caches stay: each carries the stamps of what it depends on and
+            // discards itself on a mismatch, so a wipe here only made every game compile everything again
+            // after every update, and took the game list and catalog caches with it. The marker lives in
+            // the data root beside the caches, not in this package's preferences, and is written only
+            // after every legacy file went, so a failed pass is retried on the next launch.
             runCatching {
                 val cacheDir = File(root, "cache")
                 val marker = File(cacheDir, ".install")
                 val recorded = runCatching { marker.readText() }.getOrNull()
                 if (recorded != install) {
-                    val wiped = !cacheDir.exists() || cacheDir.deleteRecursively()
-                    if (wiped && cacheDir.mkdirs()) {
+                    val legacy = LegacyGpuCache.select(cacheDir.list()?.toList() ?: emptyList())
+                    val gone = legacy.all { name -> File(cacheDir, name).let { !it.exists() || it.deleteRecursively() } }
+                    if (gone && (cacheDir.isDirectory || cacheDir.mkdirs())) {
                         marker.writeText(install)
-                        android.util.Log.i("ARMSX2", "New install ($install): cleared GS shader/pipeline cache")
+                        android.util.Log.i("ARMSX2", "New install ($install): removed ${legacy.size} pre-stamp GPU cache files")
                     } else {
-                        android.util.Log.w("ARMSX2", "New install ($install): could not clear ${cacheDir.path}")
+                        android.util.Log.w("ARMSX2", "New install ($install): could not remove the pre-stamp GPU caches in ${cacheDir.path}")
                     }
                 }
             }
@@ -2286,6 +2305,15 @@ open class MainActivityRuntime : ComponentActivity() {
      *  per process. */
     private var emucoreInitDone = false
 
+    /** The instruction set extension this APK was compiled for that the CPU lacks, or null.
+     *  The a11/a13/a15 APKs are built for ARMv8.2 with FP16 and DotProd; on a CPU without them
+     *  the core dies with SIGILL, often minutes into a game. When this is non-null the core is
+     *  never started and the app shows [CpuUnsupportedScreen] instead. */
+    private val missingCpuFeature: String? by lazy {
+        if (NativeApp.hasNoNativeBinary) null
+        else runCatching { NativeApp.missingCpuFeature() }.getOrNull()
+    }
+
     /** Latch for the debug-build auto-boot-to-BIOS path. Fires once per
      *  process from kickoffEmucoreInit's tail so JIT tests finish first,
      *  then runs startBios() with no game disc. Used for perfape baseline
@@ -2331,7 +2359,7 @@ open class MainActivityRuntime : ComponentActivity() {
      * flipped).
      */
     private fun kickoffEmucoreInit() {
-        if (emucoreInitDone) return
+        if (emucoreInitDone || missingCpuFeature != null) return
         // A chosen SD card or custom folder must be reachable before the core is pointed at it.
         // If it is not, hold init rather than fall back: falling back is how saves "vanished",
         // since the core then ran from app-private storage with a fresh, empty set of cards.
@@ -2774,6 +2802,9 @@ open class MainActivityRuntime : ComponentActivity() {
         // while the activity is paused.
         getSystemService(android.hardware.input.InputManager::class.java)
             ?.registerInputDeviceListener(inputDeviceListener, null)
+        // The listener only reports changes from here on, and the activity can be recreated while
+        // the process (and TouchControls' last answer) lives on, so ask again.
+        com.armsx2.ui.touch.TouchControls.refreshGamepadConnected()
         setupComplete.value = prefs.getBoolean("setupComplete", false)
         systemDir.value = prefs.getString("systemDir", null)
         bios.value = prefs.getString("bios", null)
@@ -2910,7 +2941,8 @@ open class MainActivityRuntime : ComponentActivity() {
             // reliable system UI is genuinely needed: the setup wizard, the touch-layout
             // editor, and the unsupported-hardware error screens. (Previously `showLibrary`
             // and plain STOPPED forced the bar on for the whole library.)
-            val showSystemBars = !setupComplete.value ||
+            val showSystemBars = missingCpuFeature != null ||
+                !setupComplete.value ||
                 setupEditorVisible.value ||
                 eState.value == EmuState.RENDER_UNSUPPORTED ||
                 eState.value == EmuState.EMULATOR_UNSUPPORTED
@@ -2968,7 +3000,10 @@ open class MainActivityRuntime : ComponentActivity() {
             // Setup wizard runs once. After it persists prefs and flips
             // setupComplete the main emulator UI takes over. Re-entering
             // setup requires clearing app data (or wiping the prefs key).
-            if (!setupComplete.value || setupEditorVisible.value) {
+            val missingCpu = missingCpuFeature
+            if (missingCpu != null) {
+                CpuUnsupportedScreen(missingCpu)
+            } else if (!setupComplete.value || setupEditorVisible.value) {
                 com.armsx2.ui.onboarding.OnboardingScreen()
             } else if (setupComplete.value) {
                 // The chosen data folder could not be reached at startup (see waitForDataRoot).
@@ -3371,6 +3406,27 @@ open class MainActivityRuntime : ComponentActivity() {
                     com.armsx2.remoteplay.RemotePlayNoticeBanner()
                 }
             }
+            }
+        }
+    }
+
+    /** In place of everything else when this APK needs instructions the CPU lacks. */
+    @androidx.compose.runtime.Composable
+    private fun CpuUnsupportedScreen(missing: String) {
+        Box(Modifier
+            .fillMaxSize()
+            .background(Colors.surface.value)) {
+            Column(Modifier
+                .align(Alignment.Center)
+                .padding(24.dp)) {
+                Text(
+                    str("cpu.unsupported.title"), fontSize = 22.sp, color = Colors.pasx2_blue,
+                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                )
+                Text(
+                    str("cpu.unsupported.body").format(missing), fontSize = 16.sp, color = Colors.pasx2_blue,
+                    modifier = Modifier.padding(top = 16.dp)
+                )
             }
         }
     }

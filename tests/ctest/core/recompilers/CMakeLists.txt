@@ -29,6 +29,10 @@ add_pcsx2_test(recompiler_tests
 	iop_cycle_accounting_tests.cpp
 	iop_frame_tests.cpp
 	iop_jump_tests.cpp
+	iop_jump_target_tests.cpp
+	rec_error_exit_tests.cpp
+	rec_error_report_tests.cpp
+	rec_crash_report_tests.cpp
 	iop_branch_tests.cpp
 	iop_cop0_tests.cpp
 	iop_memory_access_tests.cpp
@@ -74,6 +78,7 @@ add_pcsx2_test(recompiler_tests
 	ee_rec_gem2_coherence_tests.cpp
 	ee_rec_iop_handoff_tests.cpp
 	ee_rec_jump_tests.cpp
+	ee_rec_jump_target_tests.cpp
 	ee_rec_loadstore_tests.cpp
 	ee_rec_mmi_coherence_tests.cpp
 	ee_rec_mmi_simd_tests.cpp
@@ -146,6 +151,7 @@ add_pcsx2_test(recompiler_tests
 	vu1_xgkick_tests.cpp
 	vu1_xgkick_drain_tests.cpp
 	ee_vu1_vif_dispatch_tests.cpp
+	vif_fifo_tests.cpp
 	vu_capture_format_tests.cpp
 	vu_replay_tests.cpp
 	mvu_cache_exhaustion_tests.cpp
@@ -162,6 +168,7 @@ add_pcsx2_test(recompiler_tests
 	mvu_lane_fmul_fold_tests.cpp
 	mvu_abi_digest_tests.cpp
 	mvu_persist_roundtrip_tests.cpp
+	mvu_jump_table_tests.cpp
 	mvu_persist_relocation_tests.cpp
 	mvu_block_sharing_cycles_tests.cpp
 	mvu_progcache_disk_tests.cpp

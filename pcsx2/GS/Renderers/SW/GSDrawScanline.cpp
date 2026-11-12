@@ -178,6 +178,7 @@ bool GSDrawScanline::SetupDraw(GSRasterizerData& data, bool allow_compile)
 	sel.fst = global.sel.fst;
 	sel.uvwalk = global.sel.uvwalk;
 	sel.stqplane = global.sel.stqplane;
+	sel.stqfield = global.sel.stqfield;
 	sel.fge = global.sel.fge;
 	sel.prim = global.sel.prim;
 	sel.fb = global.sel.fb;
@@ -247,6 +248,22 @@ static __forceinline VectorI GSSaturateCoordinate(const VectorI& c)
 	    .sll32<GS_COORD_SIXTEENTH_SHIFT>();
 }
 
+// How the formed coordinate reaches the console's field when the draw can reach its
+// limits (sel.stqfield, GSStqExtremes.h): at 32768 sixteenths or more it reads 0x7FFF
+// (texel 2047, weight 15), at -32768 or less it reads -0x8000; anything between takes
+// the half-texel step unclamped, down to texel -2049. Works in sixteenths on the
+// truncated coordinate, before and instead of the half step and the saturate. Costs
+// nothing on a draw that cannot reach the field: there the ordinary path runs.
+__forceinline static VectorI GSFormCoordinateField(const VectorI& c16, const VectorI& half)
+{
+	const VectorI c = c16.sra32<GS_COORD_SIXTEENTH_SHIFT>();
+
+	return (c - half)
+		.blend8(VectorI(GS_COORD_SIXTEENTH_MAX), c > VectorI(GS_COORD_SIXTEENTH_MAX))
+		.blend8(VectorI(GS_COORD_SIXTEENTH_MIN), c <= VectorI(GS_COORD_SIXTEENTH_MIN))
+		.sll32<GS_COORD_SIXTEENTH_SHIFT>();
+}
+
 // The GS does not divide the texture coordinate by Q. It multiplies by a
 // reciprocal on a coarse grid, so a perspective coordinate is not the true
 // quotient. An exact divide differs from the console.
@@ -267,6 +284,16 @@ __forceinline static VectorF GSPerspectiveRecip(const VectorF& q)
 #else
 	return VectorF::cast(VectorI::cast(VectorF(1.0f) / q) & VectorI(0xfffffe00));
 #endif
+}
+
+// The plane route's reciprocal of a Q count (a count of g/4, GSPerspectivePlane.h).
+// Under sel.stqfield a count of zero is the GS's fixed reciprocal rather than the
+// host's infinity: 2/g, which in these counts is 1/2 (GSStqExtremes.h).
+__forceinline static VectorF GSPlaneReciprocal(const VectorF& qcount, bool zero_is_fixed)
+{
+	const VectorF r = GSPerspectiveRecip(qcount);
+
+	return zero_is_fixed ? r.blend32(VectorF(0.5f), qcount == VectorF::zero()) : r;
 }
 
 /// The walk's carried colour, as the byte the GS stores.
@@ -290,7 +317,9 @@ __forceinline static VectorI GSStoredVertexColor(const VectorI& c)
 	return GSWalkColorByte(c).sll16<7>();
 }
 
-void GSDrawScanline::SetupColourWalkTables(GSScanlineLocalData& local, int y)
+static void BuildColourWalkEntries(GSScanlineLocalData& local, u32 entries);
+
+void GSDrawScanline::SetupColourWalkTables(GSScanlineLocalData& local, int y, int left)
 {
 	// Builds the colour and fog tables from the primitive's walk (GSColourWalk.h).
 	// From a base that is a multiple of eight, lane i sits
@@ -307,9 +336,6 @@ void GSDrawScanline::SetupColourWalkTables(GSScanlineLocalData& local, int y)
 	// likewise, fog replicated. Lanes are masked to 0..65535 first, so the
 	// unsigned pack is the identity and a negative offset survives; a signed
 	// pack would corrupt values from 32768 up.
-	constexpr int vlen = sizeof(VectorF) / sizeof(float);
-	constexpr VectorI mask16 = VectorI::cxpr(0xFFFF);
-
 	const GSColourWalk& w = local.cwalk;
 
 	if (!w.live)
@@ -366,19 +392,52 @@ void GSDrawScanline::SetupColourWalkTables(GSScanlineLocalData& local, int y)
 	const GSVector4 cfrac = rowc - rowc.floor();
 	const GSVector4 ffrac = rowf - rowf.floor();
 
-	// The row reaches the tables only through these two fractions, so skip the
-	// rebuild when they repeat. SetupPrim clears the state, so the tables cannot
-	// be from another primitive.
+	// The row reaches the tables only through these two fractions, so the entries
+	// already built for them are reused when they repeat. SetupPrim clears the
+	// state, so the tables cannot be from another primitive.
+	//
+	// A span reads one entry: s = left & 7 (and, for the stepped tables, the pair
+	// of the vector s starts in). Only that one is built; the rest are built when a
+	// row starting there asks for them, or by CompleteColourWalkTables.
+	const u32 want = 1u << (left & 7);
 	if (w.tables.state == GSColourWalkTablesBuilt
 		&& (w.tables.cfrac == cfrac).alltrue()
 		&& (w.tables.ffrac == ffrac).alltrue())
 	{
-		return;
+		if (w.tables.entries & want)
+			return;
+	}
+	else
+	{
+		local.cwalk.tables.cfrac = cfrac;
+		local.cwalk.tables.ffrac = ffrac;
+		local.cwalk.tables.state = GSColourWalkTablesBuilt;
+		local.cwalk.tables.entries = 0;
 	}
 
-	local.cwalk.tables.cfrac = cfrac;
-	local.cwalk.tables.ffrac = ffrac;
-	local.cwalk.tables.state = GSColourWalkTablesBuilt;
+	BuildColourWalkEntries(local, want);
+}
+
+void GSDrawScanline::CompleteColourWalkTables(GSScanlineLocalData& local)
+{
+	const u32 entries = local.cwalk.tables.entries;
+	if (local.cwalk.tables.state == GSColourWalkTablesBuilt && entries != 0xff)
+		BuildColourWalkEntries(local, 0xff & ~entries);
+}
+
+// Builds the entries s (bit s of `entries`) of the tables for the fractions
+// local.cwalk.tables records, and the per-vector steps the first time any entry
+// is built for them.
+static void BuildColourWalkEntries(GSScanlineLocalData& local, u32 entries)
+{
+	constexpr int vlen = sizeof(VectorF) / sizeof(float);
+	constexpr VectorI mask16 = VectorI::cxpr(0xFFFF);
+
+	const GSColourWalk& w = local.cwalk;
+	const GSVector4 cfrac = w.tables.cfrac;
+	const GSVector4 ffrac = w.tables.ffrac;
+	const u32 built = w.tables.entries;
+	local.cwalk.tables.entries = built | entries;
 
 	const VectorF gcv(w.c.gc);
 	const VectorF dwv(w.c.dw);
@@ -437,6 +496,9 @@ void GSDrawScanline::SetupColourWalkTables(GSScanlineLocalData& local, int y)
 	// pixel to lane l of the vector s starts in.
 	for (int s = 0; s < 8; s++)
 	{
+		if (!(entries & (1u << s)))
+			continue;
+
 		const int base = s & ~(vlen - 1);
 
 		for (int l = 0; l < vlen; l++)
@@ -460,13 +522,19 @@ void GSDrawScanline::SetupColourWalkTables(GSScanlineLocalData& local, int y)
 
 #if _M_SSE >= 0x501
 	// One vector is eight pixels, so the per-vector step is 8g, a whole number of units.
-	GSVector4i::storel(&local.d8.c, (GSVector4i(w.c.g8) & GSVector4i::cxpr(0xFFFF)).xzyw().pu32());
-	local.d8.p.f = GSVector4i(w.f.g8).extract32<3>();
+	if (built == 0)
+	{
+		GSVector4i::storel(&local.d8.c, (GSVector4i(w.c.g8) & GSVector4i::cxpr(0xFFFF)).xzyw().pu32());
+		local.d8.p.f = GSVector4i(w.f.g8).extract32<3>();
+	}
 #else
 	// 4g, for the x86 SSE4 generator, which steps one vector without a block.
 	// ARM64 and the C++ path use the alternating pair below.
-	local.d4.c = (GSVector4i(w.c.g * GSVector4::cxpr(4.0f)) & GSVector4i::cxpr(0xFFFF)).xzyw().pu32();
-	local.d4.f = GSVector4i(w.f.g * GSVector4::cxpr(4.0f)).zzzzh().wwww();
+	if (built == 0)
+	{
+		local.d4.c = (GSVector4i(w.c.g * GSVector4::cxpr(4.0f)) & GSVector4i::cxpr(0xFFFF)).xzyw().pu32();
+		local.d4.f = GSVector4i(w.f.g * GSVector4::cxpr(4.0f)).zzzzh().wwww();
+	}
 
 	// The per-vector step pair: the first is off[base+4+l] - off[base+l], the
 	// second is the rest of 8g. It depends on the starting vector, not on s < 4:
@@ -481,9 +549,14 @@ void GSDrawScanline::SetupColourWalkTables(GSScanlineLocalData& local, int y)
 
 	const GSVector4 kv = GSVector4::load<true>(kbuf);
 
-	// The step depends only on `base`, so all entries of a vector share one pair.
+	// The step depends only on `base`, so all entries of a vector share one pair,
+	// built with the first of them.
 	for (int base = 0; base < 8; base += vlen)
 	{
+		const u32 group = ((1u << vlen) - 1) << base;
+		if (!(entries & group) || (built & group))
+			continue;
+
 		steps(w.c, base);
 		const GSVector4 hi = GSVector4::load<true>(hibuf);
 		const GSVector4 lo = GSVector4::load<true>(lobuf);
@@ -981,7 +1054,12 @@ __ri void GSDrawScanline::CDrawScanline(int pixels, int left, int top, const GSV
 				}
 				else if (sel.ltf)
 				{
-					vf = GSSaturateCoordinate(GSTruncateCoordinate(v)).xxzzlh().srl16<12>();
+					// The vertex took the half-texel step, so the field's limits read
+					// it at the coordinate plus eight sixteenths.
+					const VectorI cv = GSTruncateCoordinate(v);
+					vf = (sel.stqfield ? GSFormCoordinateField(cv + VectorI(0x8000), VectorI(8))
+					                   : GSSaturateCoordinate(cv))
+					         .xxzzlh().srl16<12>();
 				}
 
 				s = VectorF::cast(u);
@@ -1160,7 +1238,7 @@ __ri void GSDrawScanline::CDrawScanline(int pixels, int left, int top, const GSV
 				{
 					if (!sel.fst)
 					{
-						const VectorF r = GSPerspectiveRecip(qr);
+						const VectorF r = GSPlaneReciprocal(qr, sel.stqfield);
 
 						u = VectorI(sh * (r * uscale));
 						v = VectorI(th * (r * vscale));
@@ -1555,7 +1633,7 @@ __ri void GSDrawScanline::CDrawScanline(int pixels, int left, int top, const GSV
 
 					if (!sel.fst)
 					{
-						const VectorF r = GSPerspectiveRecip(qr);
+						const VectorF r = GSPlaneReciprocal(qr, sel.stqfield);
 
 						u = VectorI(sh * (r * uscale));
 						v = VectorI(th * (r * vscale));
@@ -1577,29 +1655,57 @@ __ri void GSDrawScanline::CDrawScanline(int pixels, int left, int top, const GSV
 					u = GSTruncateCoordinate(u);
 					v = GSTruncateCoordinate(v);
 
-					if (!sel.fst && sel.ltf)
+					if (sel.stqfield)
 					{
-						// Nearest reads at the coordinate; linear straddles the pair half
-						// a texel back, so the bias applies only where linear wins. It is
-						// eight sixteenths, so it moves the texel and never the weight,
-						// and it follows the truncation because it is not part of the
-						// GS coordinate.
-						if (sel.ltfx)
-						{
-							const VectorI half = VectorI(0x8000) & lin;
+						// The console's order at the field's limits (GSStqExtremes.h).
+						// Everything here is in sixteenths and the fst route's vertices
+						// already took the half step, so that step comes back first.
+						VectorI half = VectorI::zero();
 
-							u -= half;
-							v -= half;
-						}
-						else
+						if (sel.ltf)
 						{
-							u -= 0x8000;
-							v -= 0x8000;
+							half = VectorI(8);
+
+							if (sel.fst)
+							{
+								u += 0x8000;
+								v += 0x8000;
+							}
+							else if (sel.ltfx)
+							{
+								half = half & lin;
+							}
 						}
+
+						u = GSFormCoordinateField(u, half);
+						v = GSFormCoordinateField(v, half);
 					}
+					else
+					{
+						if (!sel.fst && sel.ltf)
+						{
+							// Nearest reads at the coordinate; linear straddles the pair half
+							// a texel back, so the bias applies only where linear wins. It is
+							// eight sixteenths, so it moves the texel and never the weight,
+							// and it follows the truncation because it is not part of the
+							// GS coordinate.
+							if (sel.ltfx)
+							{
+								const VectorI half = VectorI(0x8000) & lin;
 
-					u = GSSaturateCoordinate(u);
-					v = GSSaturateCoordinate(v);
+								u -= half;
+								v -= half;
+							}
+							else
+							{
+								u -= 0x8000;
+								v -= 0x8000;
+							}
+						}
+
+						u = GSSaturateCoordinate(u);
+						v = GSSaturateCoordinate(v);
+					}
 
 					if (sel.ltf)
 					{

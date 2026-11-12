@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <mutex>
 #include "PrecompiledHeader.h"
+#include "common/HostSys.h"
 #include "common/StringUtil.h"
 #include "common/FileSystem.h"
 #include "common/ZipHelpers.h"
@@ -199,6 +200,14 @@ static jmethodID  s_vmSetPaused_mid  = nullptr;
 static jmethodID  s_onPadRumble_mid  = nullptr;
 static jmethodID  s_playSound_mid    = nullptr;
 static jmethodID  s_onAutoTuneCommitted_mid = nullptr;
+static jmethodID  s_onAutoTuneDisplayScale_mid = nullptr;
+
+// The output surface's "Display Resolution (HW scaler)" as auto-tune sees it (AutoTune::DisplayScaler). Kotlin pushes
+// the setting in effect, an auto-tune trial included, and the size it shrinks from (EmulationSurface.applyOutputScale,
+// setOutputScaleState). Auto-tune's own trial value is stored here at once, because the surface follows it on the UI
+// thread a moment later and the trial is checked straight after it is started.
+static std::atomic<int> s_hw_scaler_effective{0};
+static std::atomic<int> s_hw_scaler_base_short_side{0};
 
 ////
 std::string GetJavaString(JNIEnv *env, jstring jstr) {
@@ -399,10 +408,25 @@ Java_kr_co_iefriends_pcsx2_NativeApp_emulog(JNIEnv *env, jclass, jstring p_msg) 
         Console.WriteLnFmt("{}", msg);
 }
 
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_isEmulogOpen(JNIEnv *, jclass) {
+    // True while the core holds logs/emulog.txt open for writing. The frontend moves the log aside
+    // (BugReport's emulog backup) only while this is false: a file renamed under an open handle
+    // keeps receiving the log, and emulog.txt is not created again until the next reopen.
+    // GetFileLogDescriptor is one lock-free atomic load, safe from any thread.
+    return Log::GetFileLogDescriptor() >= 0 ? JNI_TRUE : JNI_FALSE;
+}
+
 // Defined in VMManager.cpp; see AndroidWriteStagedGameIni.
 extern void (*g_android_before_game_settings_load)(const std::string& serial, const std::string& path);
 static void AndroidWriteStagedGameIni(const std::string& serial, const std::string& path);
 static void AndroidOnAutoTuneCommitted(const char* section, const char* key, std::string_view value);
+static int AndroidDisplayScalerGet();
+static int AndroidDisplayScalerBaseShortSide();
+static void AndroidDisplayScalerSet(int value);
+static const AutoTune::DisplayScaler s_android_display_scaler = {
+    &AndroidDisplayScalerGet, &AndroidDisplayScalerBaseShortSide, &AndroidDisplayScalerSet};
 
 extern "C"
 JNIEXPORT void JNICALL
@@ -423,6 +447,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
     std::string _szBiosFolder = GetJavaString(env, p_szbiosfolder);
     g_android_before_game_settings_load = &AndroidWriteStagedGameIni;
     AutoTune::g_on_committed = &AndroidOnAutoTuneCommitted;
+    AutoTune::g_display_scaler = &s_android_display_scaler;
     EmuFolders::AppRoot = _szPath;
     EmuFolders::DataRoot = _szPath;
     EmuFolders::SetResourcesDirectory();
@@ -615,6 +640,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_initialize(JNIEnv *env, jclass clazz,
         s_playSound_mid   = env->GetStaticMethodID(s_NativeApp_class, "playSound", "(Ljava/lang/String;)V");
         s_onAutoTuneCommitted_mid = env->GetStaticMethodID(s_NativeApp_class, "onAutoTuneCommitted",
             "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        s_onAutoTuneDisplayScale_mid = env->GetStaticMethodID(s_NativeApp_class, "onAutoTuneDisplayScale", "(I)V");
     }
 
     // Bind the JNI-backed HTTP downloader's class + method IDs while we
@@ -2000,6 +2026,16 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setLandscapeRenderTop(JNIEnv*, jclass, jboo
 
 extern "C"
 JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setSideBySideVR(JNIEnv*, jclass, jboolean enabled, jint size_percent,
+                                                     jint distance_percent, jint height_percent) {
+    // Side-by-side VR for phone headsets. GS statics read live per present, like the render-top
+    // flags, so it applies with or without a VM and while paused.
+    GSSetSideBySideVR(enabled == JNI_TRUE, static_cast<int>(size_percent), static_cast<int>(distance_percent),
+                      static_cast<int>(height_percent));
+}
+
+extern "C"
+JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_setFrameSkip(JNIEnv *env, jclass clazz,
                                                   jint p_skip) {
     // Manual frameskip for low-end devices: present 1 of every (skip+1) frames.
@@ -3063,6 +3099,45 @@ static std::string s_arcade_launch_sram;
 // the BIOS, the media) than the frontend can check for, and this is how it can say which.
 static std::mutex s_last_boot_error_mutex;
 static std::string s_last_boot_error;
+// The VMBootResult of the last boot that failed, 0 (StartupSuccess) when it did not. The frontend picks
+// its own advice by it (NativeApp.BOOT_RESULT_*). Guarded by s_last_boot_error_mutex.
+static int s_last_boot_result = 0;
+static_assert(static_cast<int>(VMBootResult::StartupSuccess) == 0 &&
+                  static_cast<int>(VMBootResult::StartupFailure) == 1 &&
+                  static_cast<int>(VMBootResult::BIOSNotFound) == 3 &&
+                  static_cast<int>(VMBootResult::BIOSNotUsable) == 4,
+              "NativeApp.BOOT_RESULT_* mirror these values");
+
+// What Host::ReportErrorAsync was told during the current boot, for s_last_boot_error. Guarded by
+// s_last_boot_error_mutex. Before VMManager::Initialize every report is kept: a failed
+// CPUThreadInitialize has no other description. Inside Initialize the boot thread's own failures
+// come back in its Error, and the reports it makes there are warnings that do not stop the boot
+// (memory cards, NVRAM), so only reports from other threads are kept: the GS thread's, when the
+// render device fails to open.
+enum class BootReportPhase
+{
+    None,
+    CPUThreadInit,
+    VMInit,
+};
+static BootReportPhase s_boot_report_phase = BootReportPhase::None;
+static std::thread::id s_boot_report_thread;
+static std::string s_boot_reports;
+
+static void BeginBootReports(BootReportPhase phase)
+{
+    std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
+    s_boot_report_phase = phase;
+    s_boot_report_thread = std::this_thread::get_id();
+    s_boot_reports.clear();
+}
+
+static std::string EndBootReports()
+{
+    std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
+    s_boot_report_phase = BootReportPhase::None;
+    return std::exchange(s_boot_reports, std::string());
+}
 
 extern "C"
 JNIEXPORT void JNICALL
@@ -3079,6 +3154,13 @@ JNIEXPORT jstring JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_getLastBootError(JNIEnv* env, jclass) {
     std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
     return env->NewStringUTF(s_last_boot_error.c_str());
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getLastBootResult(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
+    return static_cast<jint>(s_last_boot_result);
 }
 
 /// The JVS_MODE a game ID's cabinet uses (0 generic, 1 light gun, 2 fighting, 3 racing, 4 drums,
@@ -3646,6 +3728,14 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setDisplayRefreshRate(JNIEnv *env, jclass c
 
 extern "C"
 JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_setOutputScaleState(JNIEnv *env, jclass clazz, jint p_hw_scaler, jint p_base_short_side) {
+    // Read by auto-tune once per half second, from the CPU thread (AndroidDisplayScalerGet).
+    s_hw_scaler_effective.store(p_hw_scaler, std::memory_order_relaxed);
+    s_hw_scaler_base_short_side.store(p_base_short_side, std::memory_order_relaxed);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_onNativeSurfaceChanged(JNIEnv *env, jclass clazz,
                                                             jobject p_surface, jint p_width, jint p_height) {
     {
@@ -3832,6 +3922,16 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setFreeSoftwareNotice(JNIEnv*, jclass, jboo
 // strings for the Auto renderer (setAutoRendererGpuStrings). The notice below pairs it with the driver
 // the open Vulkan device is on, which only native can read.
 static std::atomic<bool> s_gpu_offers_malisx2{false};
+
+// The first instruction set extension this build was compiled for that the CPU lacks, or null. The a11/a13/a15
+// APKs are built for armv8.2-a+fp16+dotprod; installed on a CPU without those, they die with SIGILL at the first
+// such instruction, often minutes in. The app asks before it starts the core and refuses with a message instead.
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_missingCpuFeature(JNIEnv* env, jclass) {
+    const char* const missing = HostSys::GetMissingBuildCpuFeature();
+    return missing ? env->NewStringUTF(missing) : nullptr;
+}
 
 extern "C"
 JNIEXPORT void JNICALL
@@ -4083,6 +4183,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
         s_cpu_thread_id = std::this_thread::get_id();
         s_cpu_thread_queue.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
+        s_last_boot_error.clear();
+        s_last_boot_result = 0;
+    }
 
     const char* error;
     if (!VMManager::PerformEarlyHardwareChecks(&error)) {
@@ -4103,10 +4208,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
         s_arcade_launch_media.clear();
         s_arcade_launch_sram.clear();
     }
-    {
-        std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
-        s_last_boot_error.clear();
-    }
     // fast_boot is deliberately left UNSET so VMManager::Initialize falls back to
     // EmuConfig.EnableFastBoot, which it reads late and on purpose ("Read fast boot setting
     // late so it can be overridden per-game").
@@ -4124,8 +4225,15 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
     Console.WriteLnFmt("@@ANDROID_RUNVM_PATH@@ empty={} path={}",
         _szPath.empty() ? 1 : 0, _szPath);
     Console.Error("Loading %s", _szPath.c_str());
+    BeginBootReports(BootReportPhase::CPUThreadInit);
     if (!VMManager::Internal::CPUThreadInitialize()) {
         Console.Error("@@ANDROID_CPU_THREAD_INIT_FAILED@@");
+        {
+            std::string reports = EndBootReports();
+            std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
+            s_last_boot_error = std::move(reports);
+            s_last_boot_result = static_cast<int>(VMBootResult::StartupFailure);
+        }
         VMManager::Internal::CPUThreadShutdown();
         CloseCPUThreadQueue();
         return false;
@@ -4155,7 +4263,9 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
     GSDumpReplayer::SetIsDumpRunner(false);
 
     Error boot_error;
+    BeginBootReports(BootReportPhase::VMInit);
     const VMBootResult boot_result = VMManager::Initialize(boot_params, &boot_error);
+    std::string boot_reports = EndBootReports();
     if (boot_result == VMBootResult::StartupSuccess)
     {
         Console.Error("VM INIT");
@@ -4246,8 +4356,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_runVMThread(JNIEnv *env, jclass clazz,
     {
         Console.Error("@@ANDROID_VM_INIT_FAILED@@ result=%d error=%s",
             static_cast<int>(boot_result), boot_error.GetDescription().c_str());
+        // A render device that fails to open leaves only "Failed to initialize GS." in boot_error;
+        // the reason is in what the GS thread reported.
         std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
-        s_last_boot_error = boot_error.GetDescription();
+        s_last_boot_error = boot_reports.empty() ? boot_error.GetDescription() : std::move(boot_reports);
+        s_last_boot_result = static_cast<int>(boot_result);
     }
     ////
     Host::PumpMessagesOnCPUThread();
@@ -4404,9 +4517,10 @@ Java_kr_co_iefriends_pcsx2_NativeApp_flushShaderCache(JNIEnv *env, jclass clazz)
     // MTGS ring and must not be posted from the UI thread), because the GS thread owns the cache's
     // lifetime: from here it could be destroyed underneath us.
     //
-    // Fire-and-forget: the UI thread never waits (onPause is on a deadline). Rate-limited, since each
-    // save serialises the whole cache, and while that runs the driver holds the cache's lock against
-    // new pipelines.
+    // Fire-and-forget: the UI thread never waits (onPause is on a deadline). Rate-limited only against a
+    // burst of lifecycle events: a save writes nothing when nothing changed since the last one, and a
+    // paused game makes no new pipelines. It was 120 s, so leaving the app twice within two minutes and
+    // then swiping it away lost everything learned since the first time.
     if (!VMManager::HasValidVM() || !MTGS::IsOpen())
         return;
     static std::atomic<s64> s_last_flush_time{0};
@@ -4414,7 +4528,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_flushShaderCache(JNIEnv *env, jclass clazz)
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
-    constexpr s64 MIN_FLUSH_INTERVAL_SEC = 120;
+    constexpr s64 MIN_FLUSH_INTERVAL_SEC = 5;
     s64 last = s_last_flush_time.load(std::memory_order_acquire);
     if (last != 0 && (now - last) < MIN_FLUSH_INTERVAL_SEC)
         return;
@@ -5173,6 +5287,24 @@ void Host::ReportErrorAsync(const std::string_view title, const std::string_view
         ERROR_LOG("ReportErrorAsync: {}: {}", title, message);
     else if (!message.empty())
         ERROR_LOG("ReportErrorAsync: {}", message);
+
+    // Kept for the boot-failure card (see s_boot_reports). "Error" and "GS" say nothing the
+    // message does not, so those titles are dropped.
+    if (message.empty())
+        return;
+    std::lock_guard<std::mutex> lock(s_last_boot_error_mutex);
+    if (s_boot_report_phase == BootReportPhase::CPUThreadInit ||
+        (s_boot_report_phase == BootReportPhase::VMInit && std::this_thread::get_id() != s_boot_report_thread))
+    {
+        if (!s_boot_reports.empty())
+            s_boot_reports += '\n';
+        if (!title.empty() && title != "Error" && title != "GS")
+        {
+            s_boot_reports.append(title);
+            s_boot_reports += ' ';
+        }
+        s_boot_reports.append(message);
+    }
 }
 
 //TODO
@@ -7166,6 +7298,14 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getBiosInfoFromFd(JNIEnv* env, jclass, jint
     return obj;
 }
 
+// True when the file is a PS1 BIOS (see IsPs1BIOS), so the import can say so instead of "not a BIOS".
+// Takes ownership of `fd`, like getBiosInfoFromFd.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_isPs1BiosFromFd(JNIEnv*, jclass, jint fd)
+{
+    return IsPs1BIOSFromFd(static_cast<int>(fd)) ? JNI_TRUE : JNI_FALSE;
+}
+
 void Native::vmSetPaused(bool paused) {
     if (!s_jvm || !s_NativeApp_class || !s_vmSetPaused_mid) return;
 
@@ -7248,6 +7388,50 @@ static void AndroidOnAutoTuneCommitted(const char* section, const char* key, std
     env->DeleteLocalRef(jsection);
     env->DeleteLocalRef(jkey);
     env->DeleteLocalRef(jvalue);
+
+    if (attached)
+        s_jvm->DetachCurrentThread();
+}
+
+// Auto-tune's view of the output surface (AutoTune::DisplayScaler). All three run on the CPU thread.
+static int AndroidDisplayScalerGet()
+{
+    return s_hw_scaler_effective.load(std::memory_order_relaxed);
+}
+
+static int AndroidDisplayScalerBaseShortSide()
+{
+    return s_hw_scaler_base_short_side.load(std::memory_order_relaxed);
+}
+
+// Auto-tune tries a hw scaler step (value >= 0) or hands the surface back to the saved setting (-1). The surface
+// is resized on the UI thread by the app, so this returns at once. A trial's value is what AndroidDisplayScalerGet
+// reports from now on; the saved setting is not known here, so -1 leaves the last value until the surface has
+// applied it and pushed the one in effect (setOutputScaleState).
+static void AndroidDisplayScalerSet(int value)
+{
+    if (value >= 0)
+        s_hw_scaler_effective.store(value, std::memory_order_relaxed);
+
+    if (!s_jvm || !s_NativeApp_class || !s_onAutoTuneDisplayScale_mid)
+        return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    const int status = s_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
+        if (s_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+            return;
+        attached = true;
+    } else if (status != JNI_OK) {
+        return;
+    }
+
+    env->CallStaticVoidMethod(s_NativeApp_class, s_onAutoTuneDisplayScale_mid, static_cast<jint>(value));
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
 
     if (attached)
         s_jvm->DetachCurrentThread();
